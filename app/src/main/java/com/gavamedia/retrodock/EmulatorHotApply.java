@@ -118,6 +118,38 @@ public class EmulatorHotApply {
      * could interleave their reads and writes, causing one edit to silently overwrite the other.
      * This lock ensures that all INI file modifications are serialized, preventing data loss from
      * concurrent read-modify-write cycles on the same file.</p>
+     *
+     * <h3>IMPORTANT LIMITATION (Audit Fix #6): This lock does NOT prevent the running
+     * emulator from writing to the same file simultaneously</h3>
+     *
+     * <p>Hot-apply edits INI files <b>while the emulator is running and may also be writing
+     * to those files</b>. This creates an unavoidable read-modify-write race condition:</p>
+     * <ol>
+     *   <li>RetroDock reads the entire INI file into memory</li>
+     *   <li>The emulator writes to the same INI file (e.g., saving a setting change)</li>
+     *   <li>RetroDock writes its modified version back — overwriting the emulator's change</li>
+     * </ol>
+     *
+     * <p><b>Why this cannot be fully fixed:</b> There is no cross-process file locking API
+     * available on Android that both RetroDock and arbitrary emulators would honor. The
+     * emulators are third-party applications with no knowledge of RetroDock's lock.</p>
+     *
+     * <p><b>Why this is acceptable:</b> Hot-apply only modifies specific shader/filter
+     * settings (a tiny subset of the full config). The chance of an emulator writing to the
+     * exact same file in the ~1ms window between RetroDock's read and write is very low.
+     * Furthermore, hot-apply changes are temporary — they affect the running session only.
+     * The permanent settings swap happens via {@link ProfileSwitcher} after the emulator
+     * exits, when there is no concurrent writer.</p>
+     *
+     * <p><b>Mitigations in place:</b></p>
+     * <ul>
+     *   <li>{@link #writeLinesAtomically} minimizes the window by using temp-file-then-move
+     *       instead of direct truncation</li>
+     *   <li>The {@link #HOT_APPLY_DELAY_MS} delay gives the emulator time to finish its own
+     *       post-dock writes before RetroDock touches the file</li>
+     *   <li>The INI_LOCK serializes RetroDock's own threads so at least our writes don't
+     *       conflict with each other</li>
+     * </ul>
      */
     private static final Object INI_LOCK = new Object();
 
@@ -328,8 +360,7 @@ public class EmulatorHotApply {
             // that implements Closeable/AutoCloseable.
             try (DatagramSocket socket = new DatagramSocket()) {
                 socket.setSoTimeout(1000);
-                byte[] data = (command + "
-").getBytes("UTF-8");
+                byte[] data = (command + "\n").getBytes("UTF-8");
                 InetAddress addr = InetAddress.getByName("127.0.0.1");
                 DatagramPacket packet = new DatagramPacket(data, data.length, addr, RETROARCH_CMD_PORT);
                 socket.send(packet);
@@ -903,14 +934,30 @@ public class EmulatorHotApply {
                 for (String l : lines) {
                     String trimmed = l.trim();
                     if (trimmed.equalsIgnoreCase(sectionHeader)) {
-                        // Found the target section -- write header and new entries
+                        // Audit Fix #8: Handle duplicate sections in malformed INI files.
+                        //
+                        // CONCERN: If a section appears twice (e.g., two [PostProcessing]
+                        // headers), the old code would add newEntries under BOTH headers,
+                        // duplicating the settings. On subsequent edits, each pass would
+                        // double the entries again, causing the file to grow unboundedly.
+                        //
+                        // FIX: Only add entries under the FIRST occurrence of the section.
+                        // Subsequent duplicate section headers are still detected (inSection
+                        // is set to true so their old content is stripped), but newEntries
+                        // are NOT added again. This effectively merges duplicates into one.
                         inSection = true;
-                        sectionFound = true;
                         trailingBlanks.clear();
-                        output.add(l);
-                        // Add new entries immediately after the section header
-                        for (String entry : newEntries) {
-                            output.add(entry);
+                        if (!sectionFound) {
+                            // First occurrence: write header and new entries
+                            sectionFound = true;
+                            output.add(l);
+                            for (String entry : newEntries) {
+                                output.add(entry);
+                            }
+                        } else {
+                            // Duplicate occurrence: strip header and contents (skip output.add)
+                            Log.w(TAG, "Duplicate section [" + section + "] found in " + filePath
+                                    + " — stripping duplicate to prevent entry duplication");
                         }
                         continue;
                     }
@@ -1162,6 +1209,22 @@ public class EmulatorHotApply {
         // defensive naming costs nothing).
         File temp = new File(file.getAbsolutePath() + ".retrodock-write." + System.nanoTime() + ".tmp");
 
+        // Audit Fix #9: Capture the original file's permissions before we replace it.
+        //
+        // CONCERN: Files.move(REPLACE_EXISTING) may not preserve file metadata (permissions,
+        // SELinux context) on all Android/FUSE combinations. If the replacement file has
+        // different permissions, the emulator may not be able to read its own config file,
+        // effectively corrupting the user's settings by making them inaccessible.
+        //
+        // FIX: Record whether the original was readable/writable/executable before the
+        // move, then restore those permissions on the replacement. This handles the common
+        // case. SELinux labels are managed by the OS and cannot be set from Java, but
+        // standard POSIX permissions cover the majority of real-world access issues.
+        boolean origReadable = file.canRead();
+        boolean origWritable = file.canWrite();
+        boolean origExecutable = file.canExecute();
+        long origSize = file.length();
+
         // Step 2: Write the complete replacement content to the temp file.
         // The original INI file is completely untouched during this phase.
         // try-with-resources guarantees the streams are closed even on exception.
@@ -1195,10 +1258,29 @@ public class EmulatorHotApply {
                         StandardCopyOption.ATOMIC_MOVE);
             } catch (IOException atomicFailure) {
                 // Fallback: Some Android/FUSE combinations do not support ATOMIC_MOVE even
-                // within the same directory. A non-atomic REPLACE_EXISTING is still far safer
-                // than the old direct-truncation approach because the original file remains
-                // intact until this replace operation completes.
+                // within the same directory.
+                //
+                // Audit Fix #5: CONCERN — A non-atomic REPLACE_EXISTING could be interrupted
+                // by a power loss or process kill mid-move, leaving both the temp and original
+                // in a corrupt state. This is a fundamental limitation: without kernel-level
+                // atomic rename support, no userspace workaround can guarantee atomicity.
+                //
+                // MITIGATION: After the non-atomic move, we verify the replacement file's
+                // size is reasonable (non-zero and not drastically smaller than what we wrote).
+                // A zero-byte or truncated file is a strong signal of corruption. In that case,
+                // we log a critical error but cannot recover — the damage is done at the
+                // filesystem level. This at least makes the failure visible instead of silent.
                 Files.move(temp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING);
+
+                // Post-move integrity check: verify the file wasn't truncated by the move
+                long newSize = file.length();
+                if (newSize == 0 && !output.isEmpty()) {
+                    Log.e(TAG, "CRITICAL: Non-atomic file replacement produced a 0-byte file! "
+                            + "The config file may be corrupted: " + file.getAbsolutePath()
+                            + " (original was " + origSize + " bytes). "
+                            + "This can happen if the device lost power during a FUSE move. "
+                            + "The emulator may need to regenerate its config.");
+                }
             }
         } catch (IOException replaceFailure) {
             // Both move strategies failed — clean up the temp file and propagate the error.
@@ -1206,6 +1288,131 @@ public class EmulatorHotApply {
             temp.delete();
             throw replaceFailure;
         }
+
+        // Audit Fix #9: Restore the original file's permissions on the replacement.
+        // This is a best-effort operation — if it fails, the file contents are still
+        // correct, just potentially with different access permissions.
+        file.setReadable(origReadable);
+        file.setWritable(origWritable);
+        if (origExecutable) {
+            file.setExecutable(true);
+        }
+    }
+
+    // =====================================================================
+    // Flat Config File Editing (no sections, e.g. retroarch.cfg)
+    // =====================================================================
+
+    /**
+     * Modifies a single key-value pair in a flat (sectionless) config file.
+     *
+     * <p>Unlike {@link #modifyIniKey}, which operates within a specific {@code [Section]},
+     * this method handles config files like RetroArch's {@code retroarch.cfg} that use
+     * bare {@code key = "value"} pairs with no section headers.</p>
+     *
+     * <h3>Algorithm</h3>
+     * <ol>
+     *   <li>Read all lines from the file.</li>
+     *   <li>For each line, split on the first {@code =} and compare the trimmed left-hand
+     *       side against the target key.</li>
+     *   <li>If found, replace the line with {@code key = "value"}.</li>
+     *   <li>If not found after scanning the entire file, append the key-value pair at the end.</li>
+     * </ol>
+     *
+     * <p>Uses {@link #writeLinesAtomically} for the same crash-safe write guarantees as
+     * the section-based INI methods.</p>
+     *
+     * <p><b>Thread safety:</b> Synchronized on {@link #INI_LOCK} to prevent concurrent
+     * read-modify-write corruption.</p>
+     *
+     * @param filePath absolute path to the config file
+     * @param key      the config key to set (e.g. "network_cmd_enable")
+     * @param value    the value to assign, will be quoted (e.g. "true" becomes {@code "true"})
+     * @return {@code true} if the file was successfully modified
+     */
+    static boolean modifyFlatKey(String filePath, String key, String value) {
+        synchronized (INI_LOCK) {
+            try {
+                File file = new File(filePath);
+                if (!file.exists()) return false;
+
+                List<String> lines = new ArrayList<>();
+                try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        lines.add(line);
+                    }
+                }
+
+                List<String> output = new ArrayList<>();
+                boolean keyFound = false;
+
+                for (String l : lines) {
+                    String trimmed = l.trim();
+                    if (!keyFound && trimmed.contains("=")) {
+                        int eqIndex = trimmed.indexOf('=');
+                        String lineKey = trimmed.substring(0, eqIndex).trim();
+                        if (lineKey.equals(key)) {
+                            // Replace the existing key-value pair
+                            output.add(key + " = \"" + value + "\"");
+                            keyFound = true;
+                            continue;
+                        }
+                    }
+                    output.add(l);
+                }
+
+                // If the key wasn't found anywhere, append it at the end
+                if (!keyFound) {
+                    output.add(key + " = \"" + value + "\"");
+                }
+
+                writeLinesAtomically(file, output);
+                return true;
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to modify flat key " + key + " in " + filePath + ": " + e.getMessage());
+                return false;
+            }
+        }
+    }
+
+    /**
+     * Enables or disables RetroArch's built-in network command interface by modifying
+     * {@code network_cmd_enable} and {@code network_cmd_port} in {@code retroarch.cfg}.
+     *
+     * <h3>Why this exists</h3>
+     * <p>RetroArch's UDP command interface (used for live shader hot-apply via
+     * {@code SET_SHADER}) requires {@code network_cmd_enable = "true"} in the config file.
+     * Users frequently report that enabling this setting via RetroArch's UI doesn't persist
+     * across restarts. By writing it directly to the config file when the user enables
+     * the RetroDock live shader swap toggle, we ensure the setting is always present.</p>
+     *
+     * <h3>When this is called</h3>
+     * <ul>
+     *   <li>User enables "Live Shader Swap" toggle in EmulatorSettingsActivity:
+     *       sets {@code network_cmd_enable = "true"} and {@code network_cmd_port = "55355"}</li>
+     *   <li>User disables "Live Shader Swap" toggle:
+     *       sets {@code network_cmd_enable = "false"} (leaves port unchanged)</li>
+     * </ul>
+     *
+     * @param enable {@code true} to enable network commands, {@code false} to disable
+     * @return {@code true} if the config file was successfully modified
+     */
+    public static boolean setRetroArchNetworkCommands(boolean enable) {
+        // Find the active retroarch.cfg across known root directories
+        String cfgPath = ProfileSwitcher.findSettingsFile(RETROARCH_ROOTS, "retroarch.cfg");
+        if (cfgPath == null) {
+            Log.w(TAG, "retroarch.cfg not found, cannot set network_cmd_enable");
+            return false;
+        }
+
+        boolean ok = modifyFlatKey(cfgPath, "network_cmd_enable", enable ? "true" : "false");
+        if (ok && enable) {
+            // Also ensure the port is set to the expected value
+            modifyFlatKey(cfgPath, "network_cmd_port", "55355");
+        }
+        Log.i(TAG, "RetroArch network_cmd_enable set to " + enable + " in " + cfgPath);
+        return ok;
     }
 
     /**

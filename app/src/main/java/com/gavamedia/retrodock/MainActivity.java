@@ -179,8 +179,398 @@ public class MainActivity extends Activity {
         detectedDeviceText = findViewById(R.id.detected_device);
         restoreSuggestedButton = findViewById(R.id.restore_suggested_button);
 
-        // Detect the device and show it
+        // -- Detect the device and show it --
         deviceProfile = DeviceProfiles.detect();
         if (deviceProfile != null) {
             detectedDeviceText.setText("Device: " + deviceProfile.displayName
-                    + "  (suggested: " + deviceProfile.dockedWidth + "
+                    + "  (suggested: " + deviceProfile.dockedWidth + "\u00d7"
+                    + deviceProfile.dockedHeight + ")");
+        } else {
+            detectedDeviceText.setText("Device: " + DeviceProfiles.getRawModel()
+                    + "  (not in database)");
+        }
+
+        // -- Load DRM nodes --
+        loadDrmNodes();
+
+        // -- Load saved preferences --
+        loadPreferences();
+
+        // -- Setup listeners --
+        setupSpinnerListener();
+        setupServiceToggle();
+        setupTestResetButtons();
+        setupEmulatorProfilesButton();
+        setupRestoreSuggestedButton();
+
+        // -- Start display monitoring for live UI updates --
+        startDisplayListener();
+
+        // -- Initial UI refresh --
+        refreshUI();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        refreshUI();
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (displayManager != null && displayListener != null) {
+            displayManager.unregisterDisplayListener(displayListener);
+        }
+        super.onDestroy();
+    }
+
+    // =======================================================================
+    //  DRM Node Discovery
+    // =======================================================================
+
+    /**
+     * Scans {@code /sys/class/drm/} for connector nodes and populates the
+     * spinner. Each node that contains a {@code status} file is included.
+     * Nodes are labeled with their connection status (connected/disconnected).
+     */
+    private void loadDrmNodes() {
+        nodeNames = new ArrayList<>();
+        nodeLabels = new ArrayList<>();
+
+        File drmDir = new File("/sys/class/drm");
+        if (drmDir.exists() && drmDir.isDirectory()) {
+            File[] entries = drmDir.listFiles();
+            if (entries != null) {
+                for (File entry : entries) {
+                    File statusFile = new File(entry, "status");
+                    if (statusFile.exists()) {
+                        String name = entry.getName();
+                        String status = ResolutionHelper.readFile(statusFile.getAbsolutePath());
+                        nodeNames.add(name);
+                        nodeLabels.add(name + " (" + status + ")");
+                    }
+                }
+            }
+        }
+
+        // Fallback: if no nodes found, add the recommended default so the
+        // spinner isn't empty and the user can still configure the app.
+        if (nodeNames.isEmpty()) {
+            nodeNames.add(RECOMMENDED_NODE);
+            nodeLabels.add(RECOMMENDED_NODE + " (default)");
+        }
+
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+                this, android.R.layout.simple_spinner_item, nodeLabels);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        drmSpinner.setAdapter(adapter);
+    }
+
+    // =======================================================================
+    //  Preferences
+    // =======================================================================
+
+    /**
+     * Loads saved preferences and restores UI state. Handles the resolution
+     * defaults lifecycle:
+     * <ul>
+     *   <li>If the user has never set a custom resolution and a device profile
+     *       exists, use the device's suggested resolution.</li>
+     *   <li>If the user has set a custom resolution, use their saved values.</li>
+     *   <li>Otherwise, fall back to 1080x1920.</li>
+     * </ul>
+     */
+    private void loadPreferences() {
+        // -- DRM node --
+        String savedNode = prefs.getString("drm_node", RECOMMENDED_NODE);
+        int nodeIndex = nodeNames.indexOf(savedNode);
+        if (nodeIndex >= 0) {
+            drmSpinner.setSelection(nodeIndex);
+        }
+
+        // -- Resolution --
+        boolean userSet = prefs.getBoolean("resolution_user_set", false);
+        String defaultW = "1080";
+        String defaultH = "1920";
+        if (deviceProfile != null) {
+            defaultW = String.valueOf(deviceProfile.dockedWidth);
+            defaultH = String.valueOf(deviceProfile.dockedHeight);
+        }
+
+        if (userSet) {
+            widthInput.setText(prefs.getString("width", defaultW));
+            heightInput.setText(prefs.getString("height", defaultH));
+        } else {
+            widthInput.setText(defaultW);
+            heightInput.setText(defaultH);
+        }
+
+        // -- Service toggle --
+        boolean enabled = prefs.getBoolean("service_enabled", false);
+        serviceToggle.setChecked(enabled);
+        resolutionSection.setVisibility(enabled ? View.VISIBLE : View.GONE);
+
+        // -- Restore suggested button --
+        // Show only when user has customized resolution AND a device profile exists
+        updateRestoreSuggestedVisibility(userSet);
+    }
+
+    /**
+     * Saves the current resolution values to SharedPreferences and marks them
+     * as user-set so they take priority over device defaults.
+     */
+    private void saveResolution() {
+        String w = widthInput.getText().toString().trim();
+        String h = heightInput.getText().toString().trim();
+        prefs.edit()
+                .putString("width", w)
+                .putString("height", h)
+                .putString("drm_node", getSelectedNode())
+                .putBoolean("resolution_user_set", true)
+                .apply();
+        updateRestoreSuggestedVisibility(true);
+    }
+
+    /**
+     * Returns the currently selected DRM node name from the spinner.
+     */
+    private String getSelectedNode() {
+        int pos = drmSpinner.getSelectedItemPosition();
+        if (pos >= 0 && pos < nodeNames.size()) {
+            return nodeNames.get(pos);
+        }
+        return RECOMMENDED_NODE;
+    }
+
+    /**
+     * Shows or hides the "Restore suggested" button based on whether the user
+     * has customized resolution and a device profile is available.
+     */
+    private void updateRestoreSuggestedVisibility(boolean userSet) {
+        if (userSet && deviceProfile != null) {
+            restoreSuggestedButton.setVisibility(View.VISIBLE);
+        } else {
+            restoreSuggestedButton.setVisibility(View.GONE);
+        }
+    }
+
+    // =======================================================================
+    //  Listeners
+    // =======================================================================
+
+    /** Saves the selected DRM node when the user picks a different one. */
+    private void setupSpinnerListener() {
+        drmSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
+                String selected = nodeNames.get(pos);
+                prefs.edit().putString("drm_node", selected).apply();
+                refreshUI();
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {}
+        });
+    }
+
+    /**
+     * Wires the service toggle to start/stop {@link DisplayMonitorService}
+     * and show/hide the resolution configuration section.
+     */
+    private void setupServiceToggle() {
+        serviceToggle.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            prefs.edit().putBoolean("service_enabled", isChecked).apply();
+            resolutionSection.setVisibility(isChecked ? View.VISIBLE : View.GONE);
+
+            if (isChecked) {
+                // Save current resolution values before starting the service
+                saveResolution();
+                startMonitorService();
+            } else {
+                stopMonitorService();
+            }
+            refreshUI();
+        });
+    }
+
+    /**
+     * Wires the Test and Reset buttons for previewing resolution changes.
+     */
+    private void setupTestResetButtons() {
+        testButton.setOnClickListener(v -> {
+            String w = widthInput.getText().toString().trim();
+            String h = heightInput.getText().toString().trim();
+            if (w.isEmpty() || h.isEmpty()) {
+                Toast.makeText(this, "Enter width and height", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            int parsedW, parsedH;
+            try {
+                parsedW = Integer.parseInt(w);
+                parsedH = Integer.parseInt(h);
+            } catch (NumberFormatException e) {
+                Toast.makeText(this, "Width and height must be numbers", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            boolean ok = ResolutionHelper.setResolution(getContentResolver(), parsedW, parsedH);
+            if (ok) {
+                Toast.makeText(this, "Resolution set to " + w + "x" + h, Toast.LENGTH_SHORT).show();
+                saveResolution();
+            } else {
+                Toast.makeText(this, "Failed to set resolution", Toast.LENGTH_SHORT).show();
+            }
+            updateCurrentRes();
+        });
+
+        resetButton.setOnClickListener(v -> {
+            boolean ok = ResolutionHelper.resetResolution(getContentResolver());
+            if (ok) {
+                Toast.makeText(this, "Resolution reset to default", Toast.LENGTH_SHORT).show();
+            } else {
+                Toast.makeText(this, "Failed to reset resolution", Toast.LENGTH_SHORT).show();
+            }
+            updateCurrentRes();
+        });
+    }
+
+    /** Opens the emulator profiles configuration screen. */
+    private void setupEmulatorProfilesButton() {
+        findViewById(R.id.emulator_profiles_button).setOnClickListener(v -> {
+            startActivity(new Intent(this, EmulatorSettingsActivity.class));
+        });
+    }
+
+    /**
+     * Wires the "Restore suggested resolution" button to clear user overrides
+     * and restore the device profile's recommended values.
+     */
+    private void setupRestoreSuggestedButton() {
+        restoreSuggestedButton.setOnClickListener(v -> {
+            if (deviceProfile == null) return;
+
+            // Clear the user-set flag and remove saved values
+            prefs.edit()
+                    .putBoolean("resolution_user_set", false)
+                    .remove("width")
+                    .remove("height")
+                    .apply();
+
+            // Restore device defaults in the UI
+            widthInput.setText(String.valueOf(deviceProfile.dockedWidth));
+            heightInput.setText(String.valueOf(deviceProfile.dockedHeight));
+            updateRestoreSuggestedVisibility(false);
+
+            Toast.makeText(this, "Restored suggested resolution", Toast.LENGTH_SHORT).show();
+        });
+    }
+
+    // =======================================================================
+    //  Service Management
+    // =======================================================================
+
+    /**
+     * Starts the {@link DisplayMonitorService} foreground service.
+     * On Android O+ (API 26+), must use {@code startForegroundService()}.
+     */
+    private void startMonitorService() {
+        Intent intent = new Intent(this, DisplayMonitorService.class);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent);
+        } else {
+            startService(intent);
+        }
+    }
+
+    /** Stops the {@link DisplayMonitorService}. */
+    private void stopMonitorService() {
+        stopService(new Intent(this, DisplayMonitorService.class));
+    }
+
+    // =======================================================================
+    //  Display Listener
+    // =======================================================================
+
+    /**
+     * Registers a {@link DisplayManager.DisplayListener} to refresh the UI
+     * whenever a display is added, removed, or changed. This keeps the node
+     * status and current resolution labels up-to-date while the activity is
+     * visible.
+     */
+    private void startDisplayListener() {
+        displayListener = new DisplayManager.DisplayListener() {
+            @Override
+            public void onDisplayAdded(int displayId) { refreshUI(); }
+
+            @Override
+            public void onDisplayRemoved(int displayId) { refreshUI(); }
+
+            @Override
+            public void onDisplayChanged(int displayId) { refreshUI(); }
+        };
+        displayManager.registerDisplayListener(displayListener, handler);
+    }
+
+    // =======================================================================
+    //  UI Refresh
+    // =======================================================================
+
+    /**
+     * Refreshes all dynamic UI elements: node connection status, service
+     * state label, and current resolution. Called on creation, on resume,
+     * and whenever a display event fires.
+     */
+    private void refreshUI() {
+        // -- Node status --
+        String node = getSelectedNode();
+        String statusPath = "/sys/class/drm/" + node + "/status";
+        String status = ResolutionHelper.readFile(statusPath);
+        nodeStatusText.setText("Status: " + status);
+
+        if ("connected".equals(status)) {
+            nodeStatusText.setTextColor(0xFF4CAF50); // green
+        } else {
+            nodeStatusText.setTextColor(0xFF888888); // gray
+        }
+
+        // -- Service status --
+        boolean enabled = prefs.getBoolean("service_enabled", false);
+        if (enabled) {
+            serviceStatusText.setText("Service: running");
+            serviceStatusText.setTextColor(0xFF4CAF50); // green
+        } else {
+            serviceStatusText.setText("Service: stopped");
+            serviceStatusText.setTextColor(0xFF888888); // gray
+        }
+
+        // -- Current resolution --
+        updateCurrentRes();
+    }
+
+    /**
+     * Reads the current display resolution via {@code wm size} and updates
+     * the {@link #currentResText} label.
+     *
+     * <p>Drains both stdout and stderr before calling {@code waitFor()} to
+     * prevent deadlock if the process fills the kernel pipe buffer.</p>
+     */
+    private void updateCurrentRes() {
+        try {
+            Process p = Runtime.getRuntime().exec(new String[]{"wm", "size"});
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    sb.append(line).append("\n");
+                }
+            }
+            // Drain stderr to prevent process from blocking
+            try (InputStreamReader err = new InputStreamReader(p.getErrorStream())) {
+                while (err.read() != -1) { /* drain */ }
+            }
+            p.waitFor();
+            currentResText.setText(sb.toString().trim());
+        } catch (Exception e) {
+            currentResText.setText("Could not read current resolution");
+        }
+    }
+}

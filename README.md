@@ -2,15 +2,15 @@
 
 **Automatically switch display resolution and emulator settings when you dock your Android gaming handheld.**
 
-RetroDock runs as a lightweight background service that detects when your device connects to a dock, TV, or external display. It instantly switches your screen resolution and swaps your emulator configurations — shaders, filters, scaling, controls — so everything looks right whether you're playing handheld or on the big screen.
+RetroDock runs as a lightweight background service that detects when your device connects to a dock, TV, or external display. It instantly switches your screen resolution and swaps your emulator configurations — shaders, filters, scaling, controls — so everything looks right, whether you're playing handheld or on the big screen.
 
 ## Why you'd want this
 
-Android gaming handhelds like the Retroid Pocket Mini 5 have a problem: their docked display output often defaults to the wrong resolution, producing a stretched or letterboxed image on your TV. RetroDock fixes this by forcing the correct widescreen resolution the moment you dock.
+Some Android gaming handhelds have a problem: their docked display output often defaults to the wrong resolution, producing a stretched or letterboxed image on your TV. RetroDock fixes this by forcing the correct widescreen resolution the moment you dock.
 
-But resolution is just the start. When you move from a 4-inch handheld screen to a 55-inch TV, you probably want different settings:
+But resolution is just one issue; when you move from a 4-inch handheld screen to a 55-inch TV, you probably want different settings, like:
 
-- **Shaders**: CRT scanline shaders look great on a TV but are unreadable on a tiny screen. LCD shaders work better handheld.
+- **Shaders**: Some shaders look great on your TV, but not so great on the tiny screen. Now you can use one when handheld, and another one when docked.
 - **Scaling and filters**: Bilinear filtering smooths pixels nicely on a big display but wastes detail on a small one.
 - **Controls**: You might want different button mappings for a docked controller vs handheld buttons.
 - **Per-game overrides**: Maybe you want a specific CRT shader for SNES games on the TV, but a clean integer-scale shader for GBA games.

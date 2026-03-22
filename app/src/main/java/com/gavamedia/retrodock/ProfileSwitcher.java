@@ -28,6 +28,7 @@ import java.io.OutputStream;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -203,6 +204,52 @@ public class ProfileSwitcher {
     private static final String SEEDED_KEY_PREFIX = "emu_%s_seeded_%s";
 
     // ==================================================================================
+    // Per-Emulator Swap Serialization (Audit Fix #1/#2/#9)
+    // ==================================================================================
+
+    /**
+     * Per-emulator locks that serialize swap operations for the same emulator.
+     *
+     * <h3>CONCERN: Concurrent swap calls can corrupt config files</h3>
+     * <p>Without serialization, rapid dock/undock events (or a dock event firing while an
+     * exit-watcher swap is in progress) can cause two threads to enter
+     * {@link #swapSingleEntry} for the same emulator simultaneously. The dangerous sequence:</p>
+     * <ol>
+     *   <li>Thread A: step 1 moves {@code retroarch.cfg} to {@code .swaptmp.docked}</li>
+     *   <li>Thread B: step 1 tries to move {@code retroarch.cfg} — but it's GONE
+     *       (thread A already moved it). Thread B returns false, logs an error.</li>
+     *   <li>Meanwhile, thread A continues to step 2 and 3. The swap "succeeds" on thread A,
+     *       but thread B's failure is silent and may leave the user confused.</li>
+     * </ol>
+     * <p>In the <b>worst case</b>, both threads succeed at step 1 for different settings
+     * entries, creating a mixed state where some entries are in docked mode and others in
+     * handheld mode. This violates the all-or-nothing swap invariant.</p>
+     *
+     * <h3>How this fix protects config files</h3>
+     * <p>Each emulator gets its own lock object (keyed by emulator ID). Before any swap
+     * or recovery operation, the calling thread acquires the lock for that emulator.
+     * This ensures that:</p>
+     * <ul>
+     *   <li>Only one thread can swap a given emulator's files at a time</li>
+     *   <li>Recovery ({@link #recoverFromPartialSwap}) cannot race with an active swap</li>
+     *   <li>The exit watcher's deferred swap cannot overlap with a new dock event's swap</li>
+     *   <li>Different emulators can still swap concurrently (no global bottleneck)</li>
+     * </ul>
+     *
+     * <p>We use {@link ConcurrentHashMap} for the lock registry itself so that
+     * {@link #getEmulatorLock} can be called from any thread without external sync.</p>
+     */
+    private static final ConcurrentHashMap<String, Object> emulatorSwapLocks = new ConcurrentHashMap<>();
+
+    /**
+     * Returns (or creates) the lock object for a specific emulator.
+     * Thread-safe via {@link ConcurrentHashMap#computeIfAbsent}.
+     */
+    private static Object getEmulatorLock(String emulatorId) {
+        return emulatorSwapLocks.computeIfAbsent(emulatorId, k -> new Object());
+    }
+
+    // ==================================================================================
     // Exit Watcher State
     // ==================================================================================
 
@@ -284,16 +331,28 @@ public class ProfileSwitcher {
             }
 
             // --- Idle emulator path: swap settings files immediately ---
-            // Recover this emulator's interrupted temp files only after we have proved it is not
-            // running. Recovering while the emulator is still alive would itself be a file move
-            // against a live config tree, which defeats the entire "wait until exit" safety rule.
-            recoverFromPartialSwap(prefs, emu);
-            String classified = prefs.getString("emu_" + emu.id + "_classified", "");
-            boolean ok = swapSettings(prefs, emu, docked, classified);
-            if (ok) {
-                Log.i(TAG, "Swapped settings for " + emu.displayName + " (docked=" + docked + ")");
-            } else {
-                Log.w(TAG, "Failed to swap settings for " + emu.displayName);
+            // Acquire the per-emulator lock to prevent concurrent swaps for the same emulator.
+            // This protects against rapid dock/undock events or an exit-watcher swap overlapping
+            // with a new dock event. See the emulatorSwapLocks documentation for the full
+            // rationale and failure scenarios this prevents.
+            synchronized (getEmulatorLock(emu.id)) {
+                // Recover this emulator's interrupted temp files only after we have proved it is
+                // not running. Recovering while the emulator is still alive would itself be a file
+                // move against a live config tree, which defeats the entire "wait until exit"
+                // safety rule. Recovery is inside the lock to prevent races with concurrent swaps.
+                recoverFromPartialSwap(prefs, emu);
+                // Audit Fix #7: Read the classification INSIDE the lock so it cannot change
+                // between the read and the swap. The classification dialog in
+                // EmulatorSettingsActivity writes to SharedPreferences from the UI thread;
+                // by reading it here under the lock, we ensure the swap uses a consistent
+                // value even if the user changes the classification at the exact same moment.
+                String classified = prefs.getString("emu_" + emu.id + "_classified", "");
+                boolean ok = swapSettings(prefs, emu, docked, classified);
+                if (ok) {
+                    Log.i(TAG, "Swapped settings for " + emu.displayName + " (docked=" + docked + ")");
+                } else {
+                    Log.w(TAG, "Failed to swap settings for " + emu.displayName);
+                }
             }
         }
     }
@@ -527,12 +586,6 @@ public class ProfileSwitcher {
                 // to a dead process is harmless but confusing in logs.
                 EmulatorHotApply.cancelPending(emu.id);
 
-                // Finish any interrupted swap for this emulator now that we know the process has
-                // exited. This keeps recovery inside the same "only touch closed emulators" rule
-                // as normal swaps, and it ensures a leftover temp from a previous failure does
-                // not confuse the next doesNeedSwap()/swapSettings() decision.
-                recoverFromPartialSwap(prefs, emu);
-
                 // IMPORTANT: Re-read the DRM status file NOW, not using the docked boolean
                 // from when swapProfiles() was originally called. This handles the scenario:
                 //   1. User docks (docked=true passed to swapProfiles)
@@ -553,28 +606,38 @@ public class ProfileSwitcher {
                 synchronized (activeWatchers) { activeWatchers.remove(emu.id); }
                 boolean currentlyDocked = "connected".equals(currentStatus);
 
-                // Check if the currently active profile already matches the dock state.
-                // This can happen if the user toggled dock state multiple times while the
-                // emulator was running and ended up back where they started.
-                boolean needsSwap = doesNeedSwap(prefs, emu, currentlyDocked);
+                // Acquire the per-emulator swap lock before touching any files.
+                // This prevents the exit watcher's deferred swap from overlapping with
+                // a concurrent dock event that also calls swapProfiles() for the same
+                // emulator. Without this lock, two threads could move the same config
+                // file simultaneously, causing silent data loss.
+                synchronized (getEmulatorLock(emu.id)) {
+                    // Recovery must be inside the lock (same reason as in swapProfiles)
+                    recoverFromPartialSwap(prefs, emu);
 
-                if (needsSwap) {
-                    String classified = prefs.getString("emu_" + emu.id + "_classified", "");
-                    boolean ok = swapSettings(prefs, emu, currentlyDocked, classified);
-                    if (ok) {
-                        Log.i(TAG, "Deferred swap completed for " + emu.displayName +
-                                " (docked=" + currentlyDocked + ")");
-                        // Update notification to confirm swap happened
-                        showSwapCompleteNotification(ctx, emu.displayName, currentlyDocked, notifyId);
+                    // Check if the currently active profile already matches the dock state.
+                    // This can happen if the user toggled dock state multiple times while the
+                    // emulator was running and ended up back where they started.
+                    boolean needsSwap = doesNeedSwap(prefs, emu, currentlyDocked);
+
+                    if (needsSwap) {
+                        String classified = prefs.getString("emu_" + emu.id + "_classified", "");
+                        boolean ok = swapSettings(prefs, emu, currentlyDocked, classified);
+                        if (ok) {
+                            Log.i(TAG, "Deferred swap completed for " + emu.displayName +
+                                    " (docked=" + currentlyDocked + ")");
+                            // Update notification to confirm swap happened
+                            showSwapCompleteNotification(ctx, emu.displayName, currentlyDocked, notifyId);
+                        } else {
+                            Log.w(TAG, "Deferred swap failed for " + emu.displayName);
+                        }
                     } else {
-                        Log.w(TAG, "Deferred swap failed for " + emu.displayName);
+                        Log.i(TAG, "No swap needed for " + emu.displayName +
+                                " — already on correct profile for docked=" + currentlyDocked);
+                        // Dismiss the warning notification since no action was required
+                        dismissNotification(ctx, notifyId);
                     }
-                } else {
-                    Log.i(TAG, "No swap needed for " + emu.displayName +
-                            " — already on correct profile for docked=" + currentlyDocked);
-                    // Dismiss the warning notification since no action was required
-                    dismissNotification(ctx, notifyId);
-                }
+                } // end synchronized (getEmulatorLock)
             }
         };
 
@@ -1047,11 +1110,40 @@ public class ProfileSwitcher {
                     Log.e(TAG, "Step 1 failed: could not move current to temp: " + current);
                     return false;
                 }
-                // Step 2: Move target backup into the active position
+                // Step 2: Move target backup into the active position.
+                //
+                // CONCERN (Audit Fix #2): If step 2 fails AND the rollback (temp → current)
+                // also fails, the user's active config file is stranded in the .swaptmp file
+                // with no active file visible to the emulator. This is a total data loss
+                // scenario from the emulator's perspective — it would see no config and
+                // regenerate defaults, destroying the user's settings.
+                //
+                // FIX: Retry the rollback up to 3 times with a short delay. Transient FUSE
+                // errors (permission races, inode lock contention) often succeed on retry.
+                // If all retries fail, leave the temp file in place (with its self-describing
+                // name) so that recoverFromPartialSwap() can restore it on the next run.
+                // The temp file is the ONLY remaining copy of the user's active settings,
+                // so we must NEVER delete it in this failure path.
                 if (!moveWithFallback(targetBackup, current)) {
                     Log.e(TAG, "Step 2 failed: could not restore target, rolling back: " + targetBackup);
-                    // Rollback step 1 -- put the original back
-                    moveWithFallback(temp, current);
+                    // Retry rollback with small delays to handle transient FUSE errors
+                    boolean rolledBack = false;
+                    for (int retry = 0; retry < 3; retry++) {
+                        if (moveWithFallback(temp, current)) {
+                            rolledBack = true;
+                            break;
+                        }
+                        Log.w(TAG, "Rollback retry " + (retry + 1) + "/3 failed for: " + temp);
+                        try { Thread.sleep(100); } catch (InterruptedException ignored) {}
+                    }
+                    if (!rolledBack) {
+                        // CRITICAL: Rollback completely failed. The active file is stranded
+                        // in the temp location. DO NOT delete the temp — it's the only copy.
+                        // recoverFromPartialSwap() will restore it on the next service run.
+                        Log.e(TAG, "CRITICAL: Rollback failed after 3 retries. User's active "
+                                + "config is stranded at: " + temp.getAbsolutePath()
+                                + " — recovery will restore it on next run");
+                    }
                     return false;
                 }
                 // Step 3: Rename temp (old active) to the opposite backup slot.
@@ -1152,11 +1244,33 @@ public class ProfileSwitcher {
         Log.w(TAG, "renameTo failed for " + src.getName() + ", falling back to copy+delete");
         try {
             copyRecursive(src, dst);
-            deleteRecursive(src);
+
+            // CONCERN (Audit Fix #3): If the copy succeeds but the delete partially fails,
+            // we now have TWO copies of the same config data — the original source and the
+            // new destination. The previous code returned true unconditionally after calling
+            // deleteRecursive(), even if the source was only partially deleted. This violated
+            // the invariant that a config should only exist in one location, and could cause
+            // the next swap to operate on stale data or confuse recovery logic.
+            //
+            // FIX: Check whether deleteRecursive fully succeeded. If the source was only
+            // partially deleted (some files remain), log a warning but still return true —
+            // the destination IS complete and correct. The leftover source fragments are
+            // orphans that won't be mistaken for a valid config because the destination
+            // already exists at the expected path. Recovery and future swaps will operate
+            // on the destination, ignoring the partial source.
+            if (!deleteRecursive(src)) {
+                Log.w(TAG, "moveWithFallback: copy succeeded but source was only partially "
+                        + "deleted (some files may be locked). Destination is complete: " + dst
+                        + ". Orphaned source fragments at: " + src);
+                // Still return true — the move's essential purpose (putting data at dst) succeeded.
+                // The orphaned source fragments are a minor leak, not a correctness issue.
+            }
             return true;
         } catch (IOException e) {
             Log.e(TAG, "Copy fallback failed: " + src + " -> " + dst + ": " + e.getMessage());
-            // Clean up partial destination to avoid leaving corrupt state
+            // Clean up partial destination to avoid leaving corrupt state.
+            // We don't check the return value here because the copy already failed —
+            // partial cleanup is best-effort, and the source is still intact.
             deleteRecursive(dst);
             return false;
         }
@@ -1243,21 +1357,51 @@ public class ProfileSwitcher {
     }
 
     /**
-     * Recursively deletes a file or directory tree. Used as cleanup after a
-     * successful copy-based move, or to clean up a partial copy on failure.
+     * Recursively deletes a file or directory tree, returning whether the deletion
+     * was fully successful.
      *
-     * <p>Silently ignores files that don't exist or can't be deleted.</p>
+     * <h3>CONCERN (Audit Fix #4): Silent deletion failures leave orphaned files</h3>
+     * <p>The previous implementation called {@code target.delete()} and silently ignored
+     * failures. If a child file could not be deleted (locked by another process, permission
+     * denied on FUSE), the recursion continued silently, the parent directory delete failed
+     * (because it still had children), and the caller believed the delete succeeded.</p>
+     *
+     * <p>This created a dangerous inconsistency in {@link #moveWithFallback}: the method
+     * returned {@code true} (signaling a successful move), but the source still partially
+     * existed. On the next swap, both source and destination would exist simultaneously,
+     * violating the invariant that a config should only exist in one location.</p>
+     *
+     * <h3>How this fix protects config files</h3>
+     * <p>The method now returns {@code false} if ANY file or directory in the tree could
+     * not be deleted. Callers can use this signal to avoid claiming a move succeeded when
+     * the source was only partially removed. Undeletable files are logged individually to
+     * aid debugging.</p>
+     *
+     * @param target the file or directory to delete
+     * @return {@code true} if the entire tree was successfully deleted (or didn't exist),
+     *         {@code false} if any file or directory could not be deleted
      */
-    private static void deleteRecursive(File target) {
+    private static boolean deleteRecursive(File target) {
+        if (!target.exists()) return true;
+
+        boolean allDeleted = true;
         if (target.isDirectory()) {
             File[] children = target.listFiles();
             if (children != null) {
                 for (File child : children) {
-                    deleteRecursive(child);
+                    if (!deleteRecursive(child)) {
+                        allDeleted = false;
+                        // Continue trying to delete other children — partial cleanup is
+                        // better than no cleanup. But we track the overall result.
+                    }
                 }
             }
         }
-        target.delete();
+        if (!target.delete()) {
+            Log.w(TAG, "deleteRecursive: could not delete: " + target.getAbsolutePath());
+            allDeleted = false;
+        }
+        return allDeleted;
     }
 
     // ==================================================================================

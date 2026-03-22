@@ -587,9 +587,7 @@ public class EmulatorSettingsActivity extends Activity {
         new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog)
                 .setTitle(emu.displayName + " — Classify Settings")
                 .setMessage("No docked/handheld profiles found. Your current " + emu.displayName
-                        + " settings will be used as a starting point.
-
-"
+                        + " settings will be used as a starting point.\n\n"
                         + "Are your current settings configured for handheld or docked play?")
                 .setPositiveButton("Handheld", (dialog, which) -> {
                     // Store "emu_{id}_enabled" = true and "emu_{id}_classified" = "handheld".
@@ -793,11 +791,9 @@ public class EmulatorSettingsActivity extends Activity {
 
         // ── Info text ──────────────────────────────────────────────────
         TextView info = new TextView(this);
-        info.setText("Sends shader commands to RetroArch via UDP while running.
-" +
-                "Auto-detects the global shader preset from your docked/handheld config directory.
-" +
-                "Requires: RetroArch > Settings > Network > Network Commands = ON");
+        info.setText("Sends shader commands to RetroArch via UDP while running.\n" +
+                "Auto-detects the global shader preset from your docked/handheld config directory.\n" +
+                "Enabling this automatically turns on Network Commands in retroarch.cfg.");
         info.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
         info.setTextColor(0xFF666688);
         info.setPadding(0, 0, 0, dp(4));
@@ -821,6 +817,11 @@ public class EmulatorSettingsActivity extends Activity {
         hotToggle.setChecked(prefs.getBoolean("retroarch_hot_apply_enabled", false));
         hotToggle.setOnCheckedChangeListener((v, checked) -> {
             prefs.edit().putBoolean("retroarch_hot_apply_enabled", checked).apply();
+            // Enable/disable RetroArch's network command interface in retroarch.cfg.
+            // This is required for the live shader swap (SET_SHADER via UDP) to work.
+            // We write it directly because RetroArch's UI sometimes fails to persist
+            // this setting across restarts.
+            new Thread(() -> EmulatorHotApply.setRetroArchNetworkCommands(checked)).start();
         });
 
         toggleRow.addView(toggleLabel);
@@ -866,10 +867,8 @@ public class EmulatorSettingsActivity extends Activity {
 
         // ── Info text ──────────────────────────────────────────────────
         TextView info = new TextView(this);
-        info.setText("Edits PostProcessing in settings.ini while running.
-" +
-                "Shader names are comma-separated (e.g. CRT-Royale,Scanlines).
-" +
+        info.setText("Edits PostProcessing in settings.ini while running.\n" +
+                "Shader names are comma-separated (e.g. CRT-Royale,Scanlines).\n" +
                 "Leave empty to disable shaders for that mode.");
         info.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
         info.setTextColor(0xFF666688);
@@ -932,8 +931,7 @@ public class EmulatorSettingsActivity extends Activity {
 
         // ── Info text ──────────────────────────────────────────────────
         TextView info = new TextView(this);
-        info.setText("Modifies scaler/filter in scummvm.ini and sends Ctrl+Alt+S to cycle.
-" +
+        info.setText("Modifies scaler/filter in scummvm.ini and sends Ctrl+Alt+S to cycle.\n" +
                 "Scalers: normal, hq2x, hq3x, 2xsai, super2xsai, supereagle, advmame2x, advmame3x, tv2x, dotmatrix");
         info.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
         info.setTextColor(0xFF666688);
@@ -997,10 +995,8 @@ public class EmulatorSettingsActivity extends Activity {
 
         // ── Info text ──────────────────────────────────────────────────
         TextView info = new TextView(this);
-        info.setText("Edits PostProcessingShader in ppsspp.ini.
-" +
-                "Takes effect on next game load (not mid-game).
-" +
+        info.setText("Edits PostProcessingShader in ppsspp.ini.\n" +
+                "Takes effect on next game load (not mid-game).\n" +
                 "Shader name must match PPSSPP's internal name (e.g. CRT-Color).");
         info.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
         info.setTextColor(0xFF666688);
