@@ -1,0 +1,271 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:padding="24dp"
+    android:background="#1a1a2e">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <!-- Header -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="RetroDock"
+            android:textSize="28sp"
+            android:textColor="#e0e0e0"
+            android:textStyle="bold"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Automatic settings switching for docked mode"
+            android:textSize="13sp"
+            android:textColor="#888888"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:id="@+id/detected_device"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Device: detecting..."
+            android:textSize="12sp"
+            android:textColor="#bb86fc"
+            android:layout_marginBottom="20dp" />
+
+        <!-- Display Output Node -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="DISPLAY OUTPUT"
+            android:textSize="12sp"
+            android:textColor="#bb86fc"
+            android:textStyle="bold"
+            android:letterSpacing="0.1"
+            android:layout_marginBottom="8dp" />
+
+        <Spinner
+            android:id="@+id/drm_spinner"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:background="#2d2d44"
+            android:padding="8dp"
+            android:popupBackground="#2d2d44"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:id="@+id/node_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Status: checking..."
+            android:textSize="13sp"
+            android:textColor="#888888"
+            android:layout_marginBottom="20dp" />
+
+        <!-- Auto-switch on dock -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginBottom="4dp">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Auto-switch on dock"
+                    android:textSize="16sp"
+                    android:textColor="#e0e0e0" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Switch resolution and emulator settings automatically"
+                    android:textSize="12sp"
+                    android:textColor="#666666" />
+
+            </LinearLayout>
+
+            <Switch
+                android:id="@+id/service_toggle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content" />
+
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/service_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Service: stopped"
+            android:textSize="13sp"
+            android:textColor="#888888"
+            android:layout_marginBottom="8dp" />
+
+        <!-- Resolution details (shown when auto-switch is enabled) -->
+        <LinearLayout
+            android:id="@+id/resolution_section"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="DOCKED RESOLUTION"
+                android:textSize="12sp"
+                android:textColor="#bb86fc"
+                android:textStyle="bold"
+                android:letterSpacing="0.1"
+                android:layout_marginBottom="8dp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginBottom="12dp">
+
+                <EditText
+                    android:id="@+id/width_input"
+                    android:layout_width="0dp"
+                    android:layout_height="48dp"
+                    android:layout_weight="1"
+                    android:inputType="number"
+                    android:text="1080"
+                    android:textColor="#e0e0e0"
+                    android:textSize="16sp"
+                    android:textColorHint="#555555"
+                    android:background="#2d2d44"
+                    android:padding="12dp"
+                    android:gravity="center" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="  \u00d7  "
+                    android:textSize="20sp"
+                    android:textColor="#888888" />
+
+                <EditText
+                    android:id="@+id/height_input"
+                    android:layout_width="0dp"
+                    android:layout_height="48dp"
+                    android:layout_weight="1"
+                    android:inputType="number"
+                    android:text="1920"
+                    android:textColor="#e0e0e0"
+                    android:textSize="16sp"
+                    android:textColorHint="#555555"
+                    android:background="#2d2d44"
+                    android:padding="12dp"
+                    android:gravity="center" />
+
+            </LinearLayout>
+
+            <!-- Current Resolution Display -->
+            <TextView
+                android:id="@+id/current_res"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Current: checking..."
+                android:textSize="13sp"
+                android:textColor="#888888"
+                android:fontFamily="monospace"
+                android:layout_marginBottom="16dp" />
+
+            <!-- Test Buttons -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:layout_marginBottom="8dp">
+
+                <Button
+                    android:id="@+id/test_button"
+                    android:layout_width="0dp"
+                    android:layout_height="48dp"
+                    android:layout_weight="1"
+                    android:text="Test"
+                    android:textColor="#ffffff"
+                    android:layout_marginEnd="8dp" />
+
+                <Button
+                    android:id="@+id/reset_button"
+                    android:layout_width="0dp"
+                    android:layout_height="48dp"
+                    android:layout_weight="1"
+                    android:text="Reset"
+                    android:textColor="#ffffff"
+                    android:layout_marginStart="8dp" />
+
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/restore_suggested_button"
+                android:layout_width="match_parent"
+                android:layout_height="40dp"
+                android:text="Restore suggested resolution"
+                android:textColor="#bb86fc"
+                android:textSize="13sp"
+                android:textAllCaps="false"
+                android:background="@android:color/transparent"
+                android:layout_marginBottom="8dp"
+                android:visibility="gone" />
+
+        </LinearLayout>
+
+        <!-- Divider -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#333355"
+            android:layout_marginBottom="16dp" />
+
+        <!-- Emulator Profiles -->
+        <Button
+            android:id="@+id/emulator_profiles_button"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:text="Emulator Profiles"
+            android:textColor="#ffffff"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Swap emulator config folders on dock/undock"
+            android:textSize="12sp"
+            android:textColor="#666666"
+            android:layout_marginBottom="20dp" />
+
+        <!-- Divider -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#333355"
+            android:layout_marginBottom="16dp" />
+
+        <!-- Help text -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="After install, grant permission from your computer:\nadb shell pm grant com.gavamedia.retrodock android.permission.WRITE_SECURE_SETTINGS"
+            android:textSize="11sp"
+            android:textColor="#555555"
+            android:fontFamily="monospace"
+            android:layout_marginBottom="8dp" />
+
+    </LinearLayout>
+</ScrollView>
