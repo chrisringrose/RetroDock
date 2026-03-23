@@ -817,11 +817,17 @@ public class EmulatorSettingsActivity extends Activity {
         hotToggle.setChecked(prefs.getBoolean("retroarch_hot_apply_enabled", false));
         hotToggle.setOnCheckedChangeListener((v, checked) -> {
             prefs.edit().putBoolean("retroarch_hot_apply_enabled", checked).apply();
+            // Live shader swap is intentionally a convenience feature, not a durable
+            // profile-editing workflow. When a user enables any hot-apply feature we
+            // surface the contract explicitly: RetroDock may re-apply the canonical
+            // handheld/docked values on emulator exit, so permanent profile edits
+            // should be made after relaunching the emulator in the target mode.
+            maybeShowHotApplyDisclaimer(checked);
             // Enable/disable RetroArch's network command interface in retroarch.cfg.
             // This is required for the live shader swap (SET_SHADER via UDP) to work.
             // We write it directly because RetroArch's UI sometimes fails to persist
             // this setting across restarts.
-            new Thread(() -> EmulatorHotApply.setRetroArchNetworkCommands(checked)).start();
+            new Thread(() -> EmulatorHotApply.setRetroArchNetworkCommands(this, checked)).start();
         });
 
         toggleRow.addView(toggleLabel);
@@ -1023,6 +1029,42 @@ public class EmulatorSettingsActivity extends Activity {
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
+     * Shows the user-facing contract for all live hot-apply features.
+     *
+     * <p>Why this dialog exists: live shader/filter swapping is deliberately treated as
+     * a temporary runtime convenience. The emulator may keep running with a hot-applied
+     * value, but RetroDock still considers the stored handheld/docked profiles to be the
+     * source of truth. On emulator exit, RetroDock may restore those canonical values so
+     * the final on-disk state matches the current device mode. Without a warning, users
+     * can reasonably assume that editing settings during a hot-swapped session will become
+     * the new permanent profile for that mode, which is not the guarantee RetroDock makes.
+     *
+     * <p>The dialog is shown only when the user turns a live-swap feature on. It is not
+     * shown when toggles are turned off, and it is not part of normal screen rendering, so
+     * existing enabled features do not trigger repeated warnings when reopening the screen.</p>
+     *
+     * @param enabled the new toggle state; only {@code true} shows the disclaimer
+     */
+    private void maybeShowHotApplyDisclaimer(boolean enabled) {
+        if (!enabled) {
+            return;
+        }
+
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog)
+                .setTitle("Live Swap Warning")
+                .setMessage("Live swap is a temporary convenience.\n\n"
+                        + "If you change emulator settings while a live swap feature is active, "
+                        + "RetroDock-managed shader or filter settings may be restored when the "
+                        + "emulator closes so the saved handheld/docked profile still matches "
+                        + "the device's final state.\n\n"
+                        + "For permanent handheld or docked profile edits, close the emulator, "
+                        + "switch to the target mode, then reopen the emulator before making "
+                        + "those changes.")
+                .setPositiveButton("OK", null)
+                .show();
+    }
+
+    /**
      * Builds a reusable toggle row for hot-apply enable/disable switches.
      *
      * <p>Creates a horizontal row with a label on the left and a {@link Switch} on the
@@ -1053,6 +1095,10 @@ public class EmulatorSettingsActivity extends Activity {
         toggle.setChecked(prefs.getBoolean(prefKey, false));
         toggle.setOnCheckedChangeListener((v, checked) -> {
             prefs.edit().putBoolean(prefKey, checked).apply();
+            // All hot-apply toggles share the same runtime-only warning. This keeps
+            // the policy consistent across DuckStation, ScummVM, and PPSSPP without
+            // duplicating slightly different warning strings in each section.
+            maybeShowHotApplyDisclaimer(checked);
         });
 
         row.addView(toggleLabel);

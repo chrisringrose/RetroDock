@@ -24,7 +24,12 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.InputStream;
-import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -59,8 +64,6 @@ import java.util.concurrent.TimeUnit;
  *           v
  *   swapProfiles(ctx, docked, statusPath)
  *           |
- *           +-- recoverFromPartialSwap()  (crash recovery -- clean up orphaned .swaptmp files)
- *           |
  *           +-- for each enabled emulator:
  *           |       |
  *           |       +-- emulator IS running?
@@ -69,6 +72,7 @@ import java.util.concurrent.TimeUnit;
  *           |       |              hotApply()        (live shader/filter changes)
  *           |       |
  *           |       +-- emulator NOT running?
+ *           |               recoverFromPartialSwap()  (only after proving emulator is idle)
  *           |               swapSettings()
  *           |                   |
  *           |                   +-- for each settings entry:
@@ -107,8 +111,10 @@ import java.util.concurrent.TimeUnit;
  * <p>
  * If the app crashes or is killed between steps of the 3-step rename, orphaned
  * {@code .swaptmp} files may remain on disk. The recovery method is called at the start
- * of every {@link #swapProfiles} invocation to detect and resolve these orphans before
- * any new swap is attempted.
+ * of each idle-emulator swap path <b>after</b> RetroDock has proved the emulator is no longer
+ * running. This ordering matters: moving files for crash recovery is itself a real file move, so
+ * recovery must obey the same "never touch configs while the emulator is live" rule as normal
+ * swaps.
  * </p>
  *
  * <h2>First-Time Swap (Classification)</h2>
@@ -143,6 +149,39 @@ import java.util.concurrent.TimeUnit;
  *   <li>If no swap is needed (the active profile already matches the current state), the
  *       watcher simply dismisses its notification.</li>
  * </ul>
+ *
+ * <h2>Untrusted Hot-Swap Sessions</h2>
+ * <p>
+ * Live hot-apply features (RetroArch UDP shaders, DuckStation/ScummVM/PPSSPP config edits)
+ * intentionally change emulator behavior while the emulator is still running. That is useful
+ * for instant dock/handheld feedback, but it creates a profile-purity problem: the file mounted
+ * on disk is still whichever profile was active when the session began. If RetroDock simply
+ * saved that live file on exit, temporary docked tweaks made during a handheld-launched session
+ * would be mislabeled as the new handheld profile, and vice versa.
+ * </p>
+ * <p>
+ * To prevent that cross-contamination, RetroDock now treats the first successful hot-apply in a
+ * running session as the moment the mounted config becomes <b>untrusted</b>. Right before that
+ * first live change, RetroDock snapshots the currently mounted profile into a private sidecar
+ * copy. On emulator exit, if any hot-apply happened during the session, RetroDock restores that
+ * trusted sidecar back to the live path <b>before</b> deciding whether a normal dock/handheld
+ * file swap is still required.
+ * </p>
+ * <p>
+ * This gives RetroDock a simple, defensible rule:
+ * </p>
+ * <ul>
+ *   <li><b>No hot-apply used:</b> preserve current exit-time behavior and save the live config.</li>
+ *   <li><b>Any hot-apply used:</b> discard the session's untrusted mounted-file edits and return
+ *       to the last trusted mounted profile before applying the final device mode.</li>
+ * </ul>
+ * <p>
+ * Important limitation: because RetroDock does not have a guaranteed emulator-launch hook, the
+ * strongest trust point it can prove is "the mounted profile immediately before the first
+ * hot-apply of this session", not necessarily "the exact bytes from process launch". That is
+ * still enough to prevent hot-swapped dock/handheld contamination, which is the integrity risk
+ * this feature is designed to eliminate.
+ * </p>
  */
 public class ProfileSwitcher {
 
@@ -177,6 +216,14 @@ public class ProfileSwitcher {
     private static final String SWAPTMP_HANDHELD_SUFFIX = ".swaptmp.handheld";
     private static final String LEGACY_SWAPTMP_SUFFIX = ".swaptmp";
     private static final String QUARANTINE_SUFFIX = ".retrodock-orphan";
+    private static final String FILE_COPY_STAGING_SUFFIX = ".retrodock-copytmp";
+    private static final String HOT_SESSION_TRUSTED_DOCKED_SUFFIX = ".retrodock-sessiontrusted.docked";
+    private static final String HOT_SESSION_TRUSTED_HANDHELD_SUFFIX = ".retrodock-sessiontrusted.handheld";
+    private static final String HOT_SESSION_ABSENT_DOCKED_SUFFIX = ".retrodock-sessionabsent.docked";
+    private static final String HOT_SESSION_ABSENT_HANDHELD_SUFFIX = ".retrodock-sessionabsent.handheld";
+    private static final String HOT_SESSION_DIRTY_SUFFIX = ".retrodock-sessiondirty";
+    private static final String MODE_DOCKED = "docked";
+    private static final String MODE_HANDHELD = "handheld";
 
     /**
      * SharedPreferences key prefixes for per-entry path resolution and first-swap seeding.
@@ -202,6 +249,143 @@ public class ProfileSwitcher {
     private static final String OVERRIDE_KEY_PREFIX = "emu_%s_override_%s";
     private static final String RESOLVED_PATH_KEY_PREFIX = "emu_%s_resolved_%s";
     private static final String SEEDED_KEY_PREFIX = "emu_%s_seeded_%s";
+    private static final String HOT_SESSION_PREPARED_KEY_PREFIX = "emu_%s_hot_session_prepared";
+    private static final String HOT_SESSION_APPLIED_KEY_PREFIX = "emu_%s_hot_session_applied";
+    private static final String HOT_SESSION_MODE_KEY_PREFIX = "emu_%s_hot_session_mode";
+
+    /**
+     * Result type for a single settings-entry swap attempt.
+     *
+     * <p>The previous boolean return value conflated three very different outcomes:
+     * <ul>
+     *   <li><b>SWAPPED</b> -- bytes really moved on disk and the entry changed state</li>
+     *   <li><b>NO_OP</b> -- nothing needed to happen for this entry right now</li>
+     *   <li><b>FAILED</b> -- a filesystem operation failed mid-flow</li>
+     * </ul>
+     * For multi-entry emulators, treating "no-op" and "failure" the same made it impossible
+     * to perform a proper all-or-nothing rollback. The transactional swap code below needs
+     * to know exactly which entries actually changed so it can undo only those entries if a
+     * later one fails.</p>
+     */
+    private enum SwapResult {
+        SWAPPED,
+        NO_OP,
+        FAILED
+    }
+
+    /**
+     * Result type for exit-time untrusted-session handling.
+     *
+     * <p>This is separate from {@link SwapResult} because "restore trusted snapshot" is not
+     * the same operation as "swap docked/handheld profiles", yet callers still need to know
+     * whether the hot-session path consumed the event or whether the normal swap logic should
+     * continue afterward.</p>
+     */
+    private enum HotSwapSessionFinalizationResult {
+        NO_SESSION,
+        RESTORED_ONLY,
+        RESTORED_AND_SWAPPED,
+        FAILED
+    }
+
+    /**
+     * In-memory view of one emulator's hot-session tracking state as persisted in
+     * SharedPreferences.
+     *
+     * <p>{@code prepared} means RetroDock already created private trusted sidecars for the
+     * current mounted profile. {@code applied} means at least one live hot-apply action really
+     * happened and the mounted file must therefore be treated as untrusted on exit. Keeping both
+     * flags lets RetroDock clean up aborted hot-apply attempts without discarding legitimate
+     * sessions that already used live mode switching successfully.</p>
+     */
+    private static final class HotSwapSessionState {
+        final boolean prepared;
+        final boolean applied;
+        final String mountedMode;
+
+        HotSwapSessionState(boolean prepared, boolean applied, String mountedMode) {
+            this.prepared = prepared;
+            this.applied = applied;
+            this.mountedMode = mountedMode;
+        }
+    }
+
+    /**
+     * Immutable plan for one settings entry inside a multi-entry emulator swap transaction.
+     *
+     * <p>We resolve all file paths up front and keep them stable for the duration of the
+     * transaction. Re-resolving mid-swap would be dangerous because auto-detection could
+     * pick a different root if files appear/disappear while the transaction is in flight.</p>
+     */
+    private static final class SettingsEntryPlan {
+        final String relPath;
+        final File current;
+        final File dockedBackup;
+        final File handheldBackup;
+        final boolean allowClassification;
+        final boolean hadBackupBeforeSwap;
+
+        SettingsEntryPlan(String relPath, File current, File dockedBackup, File handheldBackup,
+                          boolean allowClassification, boolean hadBackupBeforeSwap) {
+            this.relPath = relPath;
+            this.current = current;
+            this.dockedBackup = dockedBackup;
+            this.handheldBackup = handheldBackup;
+            this.allowClassification = allowClassification;
+            this.hadBackupBeforeSwap = hadBackupBeforeSwap;
+        }
+    }
+
+    /**
+     * Snapshot plan for one settings entry before the first hot-apply of a session.
+     *
+     * <p>Each entry needs one of two trust records:
+     * <ul>
+     *   <li>A real sidecar copy of the mounted file/directory if it existed on disk.</li>
+     *   <li>An "absent marker" if the trusted state for that entry was intentionally missing
+     *       (for example after a first-time bootstrap move where the emulator later regenerated
+     *       defaults only in memory).</li>
+     * </ul>
+     * Recording absence explicitly is important because "restore trusted state" sometimes means
+     * "delete the generated current entry and leave the path absent", not just "copy bytes back".
+     * </p>
+     */
+    private static final class HotSwapSnapshotPlan {
+        final String relPath;
+        final File current;
+        final File trustedSnapshot;
+        final File absentMarker;
+        final boolean activeExists;
+
+        HotSwapSnapshotPlan(String relPath, File current, File trustedSnapshot,
+                            File absentMarker, boolean activeExists) {
+            this.relPath = relPath;
+            this.current = current;
+            this.trustedSnapshot = trustedSnapshot;
+            this.absentMarker = absentMarker;
+            this.activeExists = activeExists;
+        }
+    }
+
+    /**
+     * Restore transaction plan for one settings entry in an untrusted hot-session cleanup.
+     *
+     * <p>During restore we temporarily park the contaminated live file in {@code dirtyParking}
+     * and copy the trusted snapshot back into place. We keep the dirty copy until the entire
+     * emulator restore transaction succeeds so a later-entry failure can still roll the earlier
+     * entries back to their pre-restore state.</p>
+     */
+    private static final class HotSwapRestorePlan {
+        final HotSwapSnapshotPlan snapshotPlan;
+        final File dirtyParking;
+        boolean parkedDirty;
+        boolean restoredTrustedCopy;
+
+        HotSwapRestorePlan(HotSwapSnapshotPlan snapshotPlan, File dirtyParking) {
+            this.snapshotPlan = snapshotPlan;
+            this.dirtyParking = dirtyParking;
+        }
+    }
 
     // ==================================================================================
     // Per-Emulator Swap Serialization (Audit Fix #1/#2/#9)
@@ -341,6 +525,41 @@ public class ProfileSwitcher {
                 // move against a live config tree, which defeats the entire "wait until exit"
                 // safety rule. Recovery is inside the lock to prevent races with concurrent swaps.
                 recoverFromPartialSwap(prefs, emu);
+
+                // If a previous running session used any live hot-apply feature, the mounted
+                // profile on disk is no longer trustworthy as the "latest saved version" for that
+                // mode. Before we do any normal dock/handheld swap logic, restore the trusted
+                // snapshot we captured immediately before the first hot-apply of that session.
+                //
+                // This is the key fix for cross-profile contamination:
+                //   1. Launch handheld profile
+                //   2. Dock while emulator is running
+                //   3. Hot-apply TV-side settings for convenience
+                //   4. User tweaks more settings before exit
+                //   5. Emulator exits
+                //
+                // Without this restore step, those step-4 edits would still be sitting in the
+                // handheld-mounted live file, and the next deferred swap would mislabel them as
+                // the new handheld truth. Finalizing the hot session first discards the
+                // untrusted mounted file and returns to the last trusted pre-hot-apply state.
+                HotSwapSessionFinalizationResult hotSessionResult =
+                        finalizeHotSwapSessionIfNeeded(ctx, prefs, emu, docked);
+                if (hotSessionResult == HotSwapSessionFinalizationResult.FAILED) {
+                    Log.w(TAG, "Skipping normal swap for " + emu.displayName
+                            + " because trusted-session finalization failed");
+                    continue;
+                }
+                if (hotSessionResult == HotSwapSessionFinalizationResult.RESTORED_ONLY) {
+                    Log.i(TAG, "Restored trusted mounted profile for " + emu.displayName
+                            + "; no additional dock/handheld swap was needed");
+                    continue;
+                }
+                if (hotSessionResult == HotSwapSessionFinalizationResult.RESTORED_AND_SWAPPED) {
+                    Log.i(TAG, "Restored trusted mounted profile and completed deferred mode swap for "
+                            + emu.displayName);
+                    continue;
+                }
+
                 // Audit Fix #7: Read the classification INSIDE the lock so it cannot change
                 // between the read and the swap. The classification dialog in
                 // EmulatorSettingsActivity writes to SharedPreferences from the UI thread;
@@ -519,10 +738,7 @@ public class ProfileSwitcher {
      * because the reserved {@code .swaptmp*} filename is no longer blocked.</p>
      */
     private static void quarantineTempFile(File tempFile, String reason) {
-        File quarantine = new File(tempFile.getAbsolutePath() + QUARANTINE_SUFFIX);
-        if (quarantine.exists()) {
-            quarantine = new File(tempFile.getAbsolutePath() + QUARANTINE_SUFFIX + "." + System.currentTimeMillis());
-        }
+        File quarantine = buildQuarantineTarget(tempFile);
 
         if (moveWithFallback(tempFile, quarantine)) {
             Log.w(TAG, "Crash recovery: quarantined temp file (" + reason + "): " + quarantine.getAbsolutePath());
@@ -614,6 +830,29 @@ public class ProfileSwitcher {
                 synchronized (getEmulatorLock(emu.id)) {
                     // Recovery must be inside the lock (same reason as in swapProfiles)
                     recoverFromPartialSwap(prefs, emu);
+
+                    // A running session that used hot-apply is finalized before any ordinary
+                    // exit-time swap decision. That ensures the mounted profile on disk is put
+                    // back to the last trusted pre-hot-apply state before we ask "do we still
+                    // need to swap to the final docked/handheld mode?".
+                    HotSwapSessionFinalizationResult hotSessionResult =
+                            finalizeHotSwapSessionIfNeeded(ctx, prefs, emu, currentlyDocked);
+                    if (hotSessionResult == HotSwapSessionFinalizationResult.FAILED) {
+                        Log.w(TAG, "Deferred finalization failed for " + emu.displayName);
+                        return;
+                    }
+                    if (hotSessionResult == HotSwapSessionFinalizationResult.RESTORED_AND_SWAPPED) {
+                        Log.i(TAG, "Deferred exit handling restored trusted state and swapped "
+                                + emu.displayName + " to docked=" + currentlyDocked);
+                        showSwapCompleteNotification(ctx, emu.displayName, currentlyDocked, notifyId);
+                        return;
+                    }
+                    if (hotSessionResult == HotSwapSessionFinalizationResult.RESTORED_ONLY) {
+                        Log.i(TAG, "Deferred exit handling restored trusted state for "
+                                + emu.displayName + " with no additional mode swap required");
+                        dismissNotification(ctx, notifyId);
+                        return;
+                    }
 
                     // Check if the currently active profile already matches the dock state.
                     // This can happen if the user toggled dock state multiple times while the
@@ -952,8 +1191,887 @@ public class ProfileSwitcher {
         return String.format(SEEDED_KEY_PREFIX, emuId, sanitizeRelPath(relPath));
     }
 
+    private static String buildHotSessionPreparedKey(String emuId) {
+        return String.format(HOT_SESSION_PREPARED_KEY_PREFIX, emuId);
+    }
+
+    private static String buildHotSessionAppliedKey(String emuId) {
+        return String.format(HOT_SESSION_APPLIED_KEY_PREFIX, emuId);
+    }
+
+    private static String buildHotSessionModeKey(String emuId) {
+        return String.format(HOT_SESSION_MODE_KEY_PREFIX, emuId);
+    }
+
     private static String sanitizeRelPath(String relPath) {
         return relPath.replace("/", "_");
+    }
+
+    private static HotSwapSessionState readHotSwapSessionState(SharedPreferences prefs, String emuId) {
+        return new HotSwapSessionState(
+                prefs.getBoolean(buildHotSessionPreparedKey(emuId), false),
+                prefs.getBoolean(buildHotSessionAppliedKey(emuId), false),
+                prefs.getString(buildHotSessionModeKey(emuId), "")
+        );
+    }
+
+    private static void writeHotSwapSessionState(SharedPreferences prefs, String emuId,
+                                                 boolean prepared, boolean applied, String mountedMode) {
+        prefs.edit()
+                .putBoolean(buildHotSessionPreparedKey(emuId), prepared)
+                .putBoolean(buildHotSessionAppliedKey(emuId), applied)
+                .putString(buildHotSessionModeKey(emuId), mountedMode)
+                .apply();
+    }
+
+    private static void clearHotSwapSessionState(SharedPreferences prefs, String emuId) {
+        prefs.edit()
+                .remove(buildHotSessionPreparedKey(emuId))
+                .remove(buildHotSessionAppliedKey(emuId))
+                .remove(buildHotSessionModeKey(emuId))
+                .apply();
+    }
+
+    private static EmulatorConfig findEmulatorById(Context ctx, String emuId) {
+        for (EmulatorConfig emu : EmulatorConfig.getInstalled(ctx)) {
+            if (emu.id.equals(emuId)) {
+                return emu;
+            }
+        }
+        for (EmulatorConfig emu : EmulatorConfig.getKnownDatabase()) {
+            if (emu.id.equals(emuId)) {
+                return emu;
+            }
+        }
+        return null;
+    }
+
+    private static File buildHotSessionTrustedSnapshot(File basePath, String mountedMode) {
+        return new File(basePath.getAbsolutePath()
+                + (MODE_DOCKED.equals(mountedMode)
+                ? HOT_SESSION_TRUSTED_DOCKED_SUFFIX
+                : HOT_SESSION_TRUSTED_HANDHELD_SUFFIX));
+    }
+
+    private static File buildHotSessionAbsentMarker(File basePath, String mountedMode) {
+        return new File(basePath.getAbsolutePath()
+                + (MODE_DOCKED.equals(mountedMode)
+                ? HOT_SESSION_ABSENT_DOCKED_SUFFIX
+                : HOT_SESSION_ABSENT_HANDHELD_SUFFIX));
+    }
+
+    private static File buildHotSessionDirtyParking(File basePath) {
+        return new File(basePath.getAbsolutePath() + HOT_SESSION_DIRTY_SUFFIX + "." + System.nanoTime());
+    }
+
+    private static String resolveManagedPathForArtifacts(SharedPreferences prefs, EmulatorConfig emu, String relPath) {
+        String override = getOverridePath(prefs, emu, relPath);
+        if (!override.isEmpty()) {
+            return override;
+        }
+        String cached = prefs.getString(buildResolvedPathKey(emu.id, relPath), "");
+        if (!cached.isEmpty()) {
+            return cached;
+        }
+        return null;
+    }
+
+    /**
+     * Infers which profile is physically mounted on disk right now for a running emulator.
+     *
+     * <p>This is the critical reference point for hot-session protection. When a user docks or
+     * undocks while the emulator is still running, RetroDock does <b>not</b> swap the config
+     * files immediately. The "mounted mode" therefore remains whichever profile was already live
+     * on disk before the hot-apply happened. That mounted profile is exactly what can become
+     * contaminated by temporary live shader/filter edits, so it is the profile we must snapshot
+     * and later restore if the session becomes untrusted.</p>
+     *
+     * <p>The inference rules mirror the UI status logic:
+     * <ul>
+     *   <li>{@code .docked} exists => the live file is handheld</li>
+     *   <li>{@code .handheld} exists => the live file is docked</li>
+     *   <li>No backups yet => fall back to the user's initial classification if available</li>
+     * </ul>
+     * If entries disagree or both backup sidecars exist simultaneously, the state is treated as
+     * unknown and hot-apply is refused. Failing closed is safer than snapshotting the wrong mode.
+     * </p>
+     */
+    private static String inferMountedMode(SharedPreferences prefs, EmulatorConfig emu) {
+        String inferred = "";
+
+        if (emu.settingsFiles == null || emu.settingsFiles.length == 0) {
+            return "";
+        }
+
+        for (String relPath : emu.settingsFiles) {
+            String resolved = findSettingsFile(prefs, emu, relPath);
+            if (resolved == null) {
+                if (isMissingManagedEntry(prefs, emu, relPath)) {
+                    Log.w(TAG, "Cannot infer mounted mode for " + emu.displayName
+                            + " because a previously managed entry disappeared: " + relPath);
+                    return "";
+                }
+                continue;
+            }
+
+            File current = new File(resolved);
+            boolean hasDockedBackup = new File(resolved + ".docked").exists();
+            boolean hasHandheldBackup = new File(resolved + ".handheld").exists();
+            String entryMode = "";
+
+            if (hasDockedBackup && hasHandheldBackup) {
+                Log.w(TAG, "Cannot infer mounted mode for " + emu.displayName
+                        + " because both backup slots exist for " + relPath);
+                return "";
+            }
+            if (hasDockedBackup) {
+                entryMode = MODE_HANDHELD;
+            } else if (hasHandheldBackup) {
+                entryMode = MODE_DOCKED;
+            } else if (current.exists()) {
+                // No backups yet means this entry has never completed a real mode swap. The only
+                // trustworthy hint is the user's original classification from the first-enable
+                // dialog. If even that is unavailable, RetroDock refuses to guess.
+                entryMode = prefs.getString("emu_" + emu.id + "_classified", "");
+            }
+
+            if (entryMode.isEmpty()) {
+                continue;
+            }
+
+            if (inferred.isEmpty()) {
+                inferred = entryMode;
+            } else if (!inferred.equals(entryMode)) {
+                Log.w(TAG, "Cannot infer mounted mode for " + emu.displayName
+                        + " because settings entries disagree (" + inferred + " vs " + entryMode + ")");
+                return "";
+            }
+        }
+
+        return inferred;
+    }
+
+    /**
+     * Ensures RetroDock has a trusted pre-hot-apply snapshot for the emulator's currently
+     * mounted profile.
+     *
+     * <p>This method is called immediately before a live hot-apply action is attempted. The first
+     * time it runs for a session, it snapshots every resolvable managed settings entry into a
+     * private sidecar file or directory. Later hot-apply operations in the same session reuse the
+     * existing snapshot. The snapshot is deliberately taken <i>before</i> the live edit so that
+     * RetroDock can restore a known-good mounted profile on exit instead of promoting a temporary
+     * hot-swapped file into the user's saved handheld/docked slots.</p>
+     *
+     * <p>If snapshot creation fails, the caller must skip the hot-apply. Allowing a live change
+     * without a trusted rollback point would recreate the exact contamination problem this feature
+     * is meant to solve.</p>
+     */
+    static boolean ensureHotSwapSessionPrepared(Context ctx, String emuId) {
+        SharedPreferences prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        EmulatorConfig emu = findEmulatorById(ctx, emuId);
+        if (emu == null) {
+            Log.w(TAG, "Cannot prepare hot-swap session for unknown emulator id: " + emuId);
+            return false;
+        }
+
+        synchronized (getEmulatorLock(emu.id)) {
+            HotSwapSessionState existing = readHotSwapSessionState(prefs, emu.id);
+            if (existing.prepared) {
+                return true;
+            }
+
+            String mountedMode = inferMountedMode(prefs, emu);
+            if (mountedMode.isEmpty()) {
+                Log.w(TAG, "Refusing hot-apply for " + emu.displayName
+                        + " because RetroDock could not prove which profile is mounted");
+                return false;
+            }
+
+            if (!createHotSwapTrustedSnapshots(prefs, emu, mountedMode)) {
+                Log.w(TAG, "Refusing hot-apply for " + emu.displayName
+                        + " because trusted-session snapshots could not be created");
+                return false;
+            }
+
+            writeHotSwapSessionState(prefs, emu.id, true, false, mountedMode);
+            Log.i(TAG, "Prepared untrusted hot-swap session for " + emu.displayName
+                    + " (mountedMode=" + mountedMode + ")");
+            return true;
+        }
+    }
+
+    /**
+     * Marks that at least one live hot-apply really happened during the current emulator session.
+     *
+     * <p>Prepared snapshots alone do not make a session untrusted. RetroDock may prepare a
+     * rollback point and then discover that the actual hot-apply failed or the emulator exited
+     * before the command could be delivered. The session becomes untrusted only after a live
+     * setting change succeeded.</p>
+     */
+    static void markHotSwapSessionApplied(Context ctx, String emuId) {
+        SharedPreferences prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        synchronized (getEmulatorLock(emuId)) {
+            HotSwapSessionState state = readHotSwapSessionState(prefs, emuId);
+            if (!state.prepared || state.applied) {
+                return;
+            }
+            writeHotSwapSessionState(prefs, emuId, true, true, state.mountedMode);
+            Log.i(TAG, "Marked hot-swap session as untrusted for " + emuId);
+        }
+    }
+
+    /**
+     * Cleans up a prepared-but-unused hot-swap session.
+     *
+     * <p>This handles aborted hot-apply attempts. Example: RetroDock snapshots the mounted
+     * profile, then the actual file rewrite fails because the emulator changed the config under
+     * us. In that case no live hot-swap really happened, so the session must not be treated as
+     * untrusted on exit. We delete the private sidecars and clear the session flags, but only if
+     * {@code applied == false}. Once any real hot-apply succeeded, the rollback point must stay
+     * intact until exit-time reconciliation.</p>
+     */
+    static void discardPreparedHotSwapSessionIfUnused(Context ctx, String emuId) {
+        SharedPreferences prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        EmulatorConfig emu = findEmulatorById(ctx, emuId);
+        if (emu == null) {
+            clearHotSwapSessionState(prefs, emuId);
+            return;
+        }
+
+        synchronized (getEmulatorLock(emu.id)) {
+            HotSwapSessionState state = readHotSwapSessionState(prefs, emu.id);
+            if (!state.prepared || state.applied) {
+                return;
+            }
+            cleanupHotSwapSessionArtifacts(prefs, emu, state.mountedMode);
+            clearHotSwapSessionState(prefs, emu.id);
+            Log.i(TAG, "Discarded unused prepared hot-swap session for " + emu.displayName);
+        }
+    }
+
+    /**
+     * Reconciles and clears an untrusted hot-swap session if one exists.
+     *
+     * <p>This is the exit-time heart of the feature. If any live hot-apply happened during the
+     * session, RetroDock first restores the last trusted mounted profile sidecar back to the live
+     * path, thereby discarding any session-time contamination of that mounted file. Only after
+     * that restore succeeds does RetroDock decide whether a normal docked/handheld swap is still
+     * required to match the device's final state.</p>
+     *
+     * <p>If the session was merely prepared but never applied, the sidecars are just cleaned up
+     * and the caller continues with normal swap logic.</p>
+     */
+    private static HotSwapSessionFinalizationResult finalizeHotSwapSessionIfNeeded(
+            Context ctx, SharedPreferences prefs, EmulatorConfig emu, boolean finalDocked) {
+        HotSwapSessionState state = readHotSwapSessionState(prefs, emu.id);
+        if (!state.prepared) {
+            return HotSwapSessionFinalizationResult.NO_SESSION;
+        }
+
+        if (!state.applied) {
+            cleanupHotSwapSessionArtifacts(prefs, emu, state.mountedMode);
+            clearHotSwapSessionState(prefs, emu.id);
+            return HotSwapSessionFinalizationResult.NO_SESSION;
+        }
+
+        if (state.mountedMode.isEmpty()) {
+            Log.e(TAG, "Hot-swap session for " + emu.displayName
+                    + " is marked applied but has no mounted-mode metadata");
+            return HotSwapSessionFinalizationResult.FAILED;
+        }
+
+        if (!restoreTrustedHotSwapSnapshots(prefs, emu, state.mountedMode)) {
+            Log.e(TAG, "Failed to restore trusted mounted profile for " + emu.displayName
+                    + "; preserving hot-session markers for later retry");
+            return HotSwapSessionFinalizationResult.FAILED;
+        }
+
+        boolean mountedDocked = MODE_DOCKED.equals(state.mountedMode);
+        boolean didModeSwap = false;
+        if (finalDocked != mountedDocked) {
+            String classified = prefs.getString("emu_" + emu.id + "_classified", "");
+            if (!swapSettings(prefs, emu, finalDocked, classified)) {
+                Log.e(TAG, "Trusted-session restore succeeded but final mode swap still failed for "
+                        + emu.displayName + " (finalDocked=" + finalDocked + ")");
+                cleanupHotSwapSessionArtifacts(prefs, emu, state.mountedMode);
+                clearHotSwapSessionState(prefs, emu.id);
+                return HotSwapSessionFinalizationResult.FAILED;
+            }
+            didModeSwap = true;
+        }
+
+        cleanupHotSwapSessionArtifacts(prefs, emu, state.mountedMode);
+        clearHotSwapSessionState(prefs, emu.id);
+        return didModeSwap
+                ? HotSwapSessionFinalizationResult.RESTORED_AND_SWAPPED
+                : HotSwapSessionFinalizationResult.RESTORED_ONLY;
+    }
+
+    /**
+     * Creates the private "trusted mounted profile" sidecars for one emulator session.
+     *
+     * <p><b>Problem this solves:</b> once a live hot-apply succeeds, the file currently mounted
+     * at the active config path can no longer be trusted as the user's true handheld/docked
+     * profile. The emulator may later save temporary runtime changes into that same mounted file.
+     * If RetroDock simply saved that exit-time file into `.handheld` or `.docked`, it would be
+     * mislabeled profile drift, not a real user-confirmed profile save.</p>
+     *
+     * <p><b>Fix:</b> before the first live edit of the session, snapshot the currently mounted
+     * active path into a private sidecar. If the trusted state for that entry is "path absent",
+     * record that fact explicitly with an empty marker file instead of inventing bytes. This lets
+     * exit-time reconciliation restore either a real file/directory or a trusted absence.</p>
+     *
+     * <p><b>Failure policy:</b> fail closed. If any entry cannot be snapshotted safely, the
+     * entire hot-apply must be refused. Live edits without a rollback point would recreate the
+     * contamination bug this feature is meant to eliminate.</p>
+     */
+    private static boolean createHotSwapTrustedSnapshots(SharedPreferences prefs, EmulatorConfig emu,
+                                                         String mountedMode) {
+        List<HotSwapSnapshotPlan> plans = buildHotSwapSnapshotPlans(prefs, emu, mountedMode);
+        if (plans.isEmpty()) {
+            Log.w(TAG, "No managed settings entries could be snapshotted for " + emu.displayName);
+            return false;
+        }
+
+        for (HotSwapSnapshotPlan plan : plans) {
+            if (!deleteIfExists(plan.trustedSnapshot) || !deleteIfExists(plan.absentMarker)) {
+                cleanupHotSwapSessionArtifacts(prefs, emu, mountedMode);
+                return false;
+            }
+
+            boolean ok;
+            if (plan.activeExists) {
+                ok = copyPathForSnapshot(plan.current, plan.trustedSnapshot);
+            } else {
+                ok = createMarkerFile(plan.absentMarker);
+            }
+
+            if (!ok) {
+                Log.e(TAG, "Failed to create trusted hot-session snapshot for "
+                        + plan.current.getAbsolutePath());
+                cleanupHotSwapSessionArtifacts(prefs, emu, mountedMode);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Restores the trusted mounted-profile sidecars back to the active config paths.
+     *
+     * <p><b>Why this is a transaction:</b> many emulators have more than one managed settings
+     * entry. Restoring entry 1 and then failing on entry 2 would leave the emulator half restored
+     * and half contaminated. To avoid that, we park each current live entry in a temporary
+     * `.retrodock-sessiondirty.*` sidecar, copy the trusted snapshot back into place, and keep
+     * the parked dirty copy until the whole emulator restore succeeds. If any later entry fails,
+     * we can roll the earlier entries back to the exact exit-time state we found.</p>
+     *
+     * <p><b>Why copy instead of move the trusted snapshot:</b> the trusted sidecar is our only
+     * rollback anchor while the restore transaction is still in flight. Keeping it intact until
+     * the entire restore succeeds prevents one partial restore failure from also destroying the
+     * last known-good snapshot.</p>
+     */
+    private static boolean restoreTrustedHotSwapSnapshots(SharedPreferences prefs, EmulatorConfig emu,
+                                                          String mountedMode) {
+        List<HotSwapSnapshotPlan> snapshotPlans = buildHotSwapSnapshotPlans(prefs, emu, mountedMode);
+        List<HotSwapRestorePlan> restorePlans = new ArrayList<>();
+
+        for (HotSwapSnapshotPlan snapshotPlan : snapshotPlans) {
+            boolean hasTrustedSnapshot = snapshotPlan.trustedSnapshot.exists();
+            boolean hasAbsentMarker = snapshotPlan.absentMarker.exists();
+            if (!hasTrustedSnapshot && !hasAbsentMarker) {
+                continue;
+            }
+            if (hasTrustedSnapshot && hasAbsentMarker) {
+                Log.e(TAG, "Hot-session restore found both trusted snapshot and absent marker for "
+                        + snapshotPlan.current.getAbsolutePath());
+                return false;
+            }
+            restorePlans.add(new HotSwapRestorePlan(snapshotPlan,
+                    buildHotSessionDirtyParking(snapshotPlan.current)));
+        }
+
+        if (restorePlans.isEmpty()) {
+            Log.e(TAG, "Hot-session restore requested for " + emu.displayName
+                    + " but no trusted sidecars were present");
+            return false;
+        }
+
+        List<HotSwapRestorePlan> appliedPlans = new ArrayList<>();
+        for (HotSwapRestorePlan restorePlan : restorePlans) {
+            appliedPlans.add(restorePlan);
+
+            if (restorePlan.snapshotPlan.current.exists()) {
+                if (!moveWithFallback(restorePlan.snapshotPlan.current, restorePlan.dirtyParking)) {
+                    Log.e(TAG, "Failed to park untrusted live entry before restore: "
+                            + restorePlan.snapshotPlan.current.getAbsolutePath());
+                    rollbackRestoredHotSwapEntries(appliedPlans);
+                    return false;
+                }
+                restorePlan.parkedDirty = true;
+            }
+
+            if (restorePlan.snapshotPlan.trustedSnapshot.exists()) {
+                if (!copyPathForSnapshot(restorePlan.snapshotPlan.trustedSnapshot,
+                        restorePlan.snapshotPlan.current)) {
+                    Log.e(TAG, "Failed to copy trusted snapshot back into place: "
+                            + restorePlan.snapshotPlan.current.getAbsolutePath());
+                    rollbackRestoredHotSwapEntries(appliedPlans);
+                    return false;
+                }
+                restorePlan.restoredTrustedCopy = true;
+            } else if (!restorePlan.snapshotPlan.absentMarker.exists()) {
+                Log.e(TAG, "Trusted restore metadata vanished mid-restore for "
+                        + restorePlan.snapshotPlan.current.getAbsolutePath());
+                rollbackRestoredHotSwapEntries(appliedPlans);
+                return false;
+            }
+        }
+
+        for (HotSwapRestorePlan restorePlan : restorePlans) {
+            if (restorePlan.parkedDirty && !deleteIfExists(restorePlan.dirtyParking)) {
+                Log.w(TAG, "Trusted restore succeeded but cleanup of parked dirty entry failed: "
+                        + restorePlan.dirtyParking.getAbsolutePath());
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Rolls back a partially completed trusted-restore transaction.
+     *
+     * <p>This method is the inverse of {@link #restoreTrustedHotSwapSnapshots}. For every entry
+     * that already changed, remove any restored trusted copy and move the parked dirty live copy
+     * back into place. Reverse-order rollback mirrors normal transaction unwinding and minimizes
+     * the risk of colliding with paths we just recreated.</p>
+     */
+    private static boolean rollbackRestoredHotSwapEntries(List<HotSwapRestorePlan> appliedPlans) {
+        boolean allRolledBack = true;
+        for (int i = appliedPlans.size() - 1; i >= 0; i--) {
+            HotSwapRestorePlan plan = appliedPlans.get(i);
+
+            if (plan.restoredTrustedCopy && plan.snapshotPlan.current.exists()
+                    && !deleteRecursive(plan.snapshotPlan.current)) {
+                Log.e(TAG, "Failed to delete partially restored trusted copy during rollback: "
+                        + plan.snapshotPlan.current.getAbsolutePath());
+                allRolledBack = false;
+            }
+
+            if (plan.parkedDirty) {
+                if (plan.snapshotPlan.current.exists()
+                        && !deleteRecursive(plan.snapshotPlan.current)) {
+                    Log.e(TAG, "Failed to clear restore target before moving dirty copy back: "
+                            + plan.snapshotPlan.current.getAbsolutePath());
+                    allRolledBack = false;
+                    continue;
+                }
+                if (!moveWithFallback(plan.dirtyParking, plan.snapshotPlan.current)) {
+                    Log.e(TAG, "Failed to move parked dirty entry back during rollback: "
+                            + plan.dirtyParking.getAbsolutePath());
+                    allRolledBack = false;
+                }
+            }
+        }
+        return allRolledBack;
+    }
+
+    /**
+     * Deletes all private hot-session sidecars for one emulator.
+     *
+     * <p>Cleanup deliberately removes both docked and handheld trusted/absent markers rather than
+     * trying to infer which one "should" exist. These sidecars are purely internal bookkeeping
+     * owned by RetroDock; if stale leftovers from an older crash survive, the safest cleanup is to
+     * remove the entire private namespace and let the next hot session rebuild it from scratch.</p>
+     */
+    private static boolean cleanupHotSwapSessionArtifacts(SharedPreferences prefs, EmulatorConfig emu,
+                                                          String mountedMode) {
+        boolean allDeleted = true;
+        if (emu.settingsFiles == null || emu.settingsFiles.length == 0) {
+            return true;
+        }
+
+        for (String relPath : emu.settingsFiles) {
+            String resolved = resolveManagedPathForArtifacts(prefs, emu, relPath);
+            if (resolved == null) {
+                resolved = findSettingsFile(prefs, emu, relPath);
+            }
+            if (resolved == null) {
+                continue;
+            }
+
+            File basePath = new File(resolved);
+            allDeleted &= deleteIfExists(buildHotSessionTrustedSnapshot(basePath, MODE_DOCKED));
+            allDeleted &= deleteIfExists(buildHotSessionTrustedSnapshot(basePath, MODE_HANDHELD));
+            allDeleted &= deleteIfExists(buildHotSessionAbsentMarker(basePath, MODE_DOCKED));
+            allDeleted &= deleteIfExists(buildHotSessionAbsentMarker(basePath, MODE_HANDHELD));
+            allDeleted &= cleanupHotSwapDirtyParkings(basePath);
+        }
+
+        return allDeleted;
+    }
+
+    /**
+     * Resolves the per-entry file plans used for snapshot creation and trusted restore.
+     *
+     * <p>The important property is path stability. Once a running session is marked untrusted, we
+     * must keep using the same physical base path that the session was prepared against. That is
+     * why this builder prefers the current managed resolver but falls back to the cached/override
+     * path RetroDock already stored for that entry.</p>
+     */
+    private static List<HotSwapSnapshotPlan> buildHotSwapSnapshotPlans(SharedPreferences prefs,
+                                                                       EmulatorConfig emu,
+                                                                       String mountedMode) {
+        List<HotSwapSnapshotPlan> plans = new ArrayList<>();
+        if (emu.settingsFiles == null || emu.settingsFiles.length == 0) {
+            return plans;
+        }
+
+        for (String relPath : emu.settingsFiles) {
+            // Prefer RetroDock's explicit override/cached path before re-running auto-detection.
+            // The hot-session feature must restore the exact same physical path it snapshotted at
+            // prepare time. If a second matching root appears later (for example a stale legacy
+            // config beside the real scoped-storage config), a fresh auto-detect pass could pick
+            // the wrong tree and restore the trusted snapshot into the wrong location.
+            String resolved = resolveManagedPathForArtifacts(prefs, emu, relPath);
+            if (resolved != null) {
+                File resolvedBase = new File(resolved);
+                if (!pathHasManagedState(resolved, true) && !pathHasHotSwapArtifacts(resolvedBase)) {
+                    resolved = null;
+                }
+            }
+            if (resolved == null) {
+                resolved = findSettingsFile(prefs, emu, relPath);
+            }
+            if (resolved == null) {
+                continue;
+            }
+
+            File current = new File(resolved);
+            plans.add(new HotSwapSnapshotPlan(
+                    relPath,
+                    current,
+                    buildHotSessionTrustedSnapshot(current, mountedMode),
+                    buildHotSessionAbsentMarker(current, mountedMode),
+                    current.exists()
+            ));
+        }
+
+        return plans;
+    }
+
+    private static boolean cleanupHotSwapDirtyParkings(File basePath) {
+        File parent = basePath.getParentFile();
+        if (parent == null || !parent.exists()) {
+            return true;
+        }
+
+        File[] children = parent.listFiles();
+        if (children == null) {
+            Log.w(TAG, "Unable to enumerate hot-session dirty sidecars in "
+                    + parent.getAbsolutePath());
+            return false;
+        }
+
+        boolean allDeleted = true;
+        String dirtyPrefix = basePath.getName() + HOT_SESSION_DIRTY_SUFFIX;
+        for (File child : children) {
+            if (!child.getName().startsWith(dirtyPrefix)) {
+                continue;
+            }
+            if (!deleteIfExists(child)) {
+                allDeleted = false;
+            }
+        }
+        return allDeleted;
+    }
+
+    private static boolean pathHasHotSwapArtifacts(File basePath) {
+        return buildHotSessionTrustedSnapshot(basePath, MODE_DOCKED).exists()
+                || buildHotSessionTrustedSnapshot(basePath, MODE_HANDHELD).exists()
+                || buildHotSessionAbsentMarker(basePath, MODE_DOCKED).exists()
+                || buildHotSessionAbsentMarker(basePath, MODE_HANDHELD).exists()
+                || hasHotSwapDirtyParking(basePath);
+    }
+
+    private static boolean hasHotSwapDirtyParking(File basePath) {
+        File parent = basePath.getParentFile();
+        if (parent == null || !parent.exists()) {
+            return false;
+        }
+
+        File[] children = parent.listFiles();
+        if (children == null) {
+            return false;
+        }
+
+        String dirtyPrefix = basePath.getName() + HOT_SESSION_DIRTY_SUFFIX;
+        for (File child : children) {
+            if (child.getName().startsWith(dirtyPrefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean deleteIfExists(File path) {
+        return path == null || !path.exists() || deleteRecursive(path);
+    }
+
+    /**
+     * Creates an empty marker file and forces it to stable storage.
+     *
+     * <p>An absent marker is how RetroDock remembers "the trusted state for this managed entry
+     * was that no active file/directory existed". Writing a real marker is safer than keeping
+     * that fact only in memory because the app may be killed between hot-apply and exit-time
+     * reconciliation.</p>
+     */
+    private static boolean createMarkerFile(File marker) {
+        File parent = marker.getParentFile();
+        if (parent == null || !parent.exists()) {
+            Log.e(TAG, "Cannot create marker because parent directory is missing: "
+                    + marker.getAbsolutePath());
+            return false;
+        }
+        try (FileOutputStream out = new FileOutputStream(marker)) {
+            out.getFD().sync();
+            return true;
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to create marker file " + marker.getAbsolutePath() + ": "
+                    + e.getMessage());
+            marker.delete();
+            return false;
+        }
+    }
+
+    /**
+     * Copies either a file or directory tree into a private trusted sidecar.
+     *
+     * <p>This helper is intentionally separate from {@link #moveWithFallback}. The hot-session
+     * feature is taking a snapshot, not trying to emulate a rename, so copy semantics are
+     * acceptable here as long as the destination is private and we verify the source did not
+     * change during the snapshot. The destination must never already exist; snapshot sidecars are
+     * treated as immutable once created.</p>
+     */
+    private static boolean copyPathForSnapshot(File src, File dst) {
+        if (!src.exists()) {
+            Log.e(TAG, "Snapshot source does not exist: " + src.getAbsolutePath());
+            return false;
+        }
+        if (dst.exists()) {
+            Log.e(TAG, "Snapshot destination already exists: " + dst.getAbsolutePath());
+            return false;
+        }
+
+        try {
+            if (src.isDirectory()) {
+                return copyDirectorySnapshot(src, dst);
+            }
+            copyFileDurably(src, dst);
+            applyBasicPermissions(src, dst);
+            return true;
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to snapshot " + src.getAbsolutePath() + " -> "
+                    + dst.getAbsolutePath() + ": " + e.getMessage());
+            deleteIfExists(dst);
+            return false;
+        }
+    }
+
+    /**
+     * Copies an entire directory tree into a trusted sidecar with before/after verification.
+     *
+     * <p><b>Why directory snapshots need extra validation:</b> unlike a regular file copy, a
+     * directory snapshot spans many child files and subdirectories. A running emulator could save
+     * a new override or rewrite one file halfway through that copy. If RetroDock blindly accepted
+     * the result, the "trusted" sidecar would already be internally inconsistent.</p>
+     *
+     * <p><b>Fix:</b> record a full tree manifest (relative paths, file sizes, timestamps, and
+     * content hashes) before the copy, copy the tree into the sidecar, then capture manifests for
+     * both the source and the copy again. The snapshot is accepted only if:</p>
+     * <ol>
+     *   <li>The source manifest is identical before and after the copy, proving the source did
+     *       not mutate while we were snapshotting it.</li>
+     *   <li>The copied tree manifest exactly matches that stable source manifest.</li>
+     * </ol>
+     *
+     * <p>This is more expensive than a blind recursive copy, but it runs only on the first
+     * successful hot-apply of a session and it dramatically raises confidence that the trusted
+     * restore point really is a coherent config tree.</p>
+     */
+    private static boolean copyDirectorySnapshot(File src, File dst) throws IOException {
+        if (!src.isDirectory()) {
+            throw new IOException("copyDirectorySnapshot requires a directory source: " + src);
+        }
+        if (dst.exists()) {
+            throw new IOException("Snapshot destination already exists: " + dst);
+        }
+
+        List<String> sourceBefore = describeDirectoryTree(src);
+        if (sourceBefore == null) {
+            throw new IOException("Could not describe source directory before snapshot: " + src);
+        }
+
+        if (!copyDirectorySnapshotRecursive(src, dst)) {
+            deleteIfExists(dst);
+            throw new IOException("Recursive directory snapshot copy failed: " + src);
+        }
+
+        List<String> sourceAfter = describeDirectoryTree(src);
+        List<String> copyAfter = describeDirectoryTree(dst);
+        if (sourceAfter == null || copyAfter == null) {
+            deleteIfExists(dst);
+            throw new IOException("Could not verify directory snapshot manifests for: " + src);
+        }
+        if (!sourceBefore.equals(sourceAfter)) {
+            deleteIfExists(dst);
+            throw new IOException("Source directory changed while snapshotting: " + src);
+        }
+        if (!sourceBefore.equals(copyAfter)) {
+            deleteIfExists(dst);
+            throw new IOException("Snapshot directory does not match source manifest: " + src);
+        }
+        return true;
+    }
+
+    private static boolean copyDirectorySnapshotRecursive(File src, File dst) throws IOException {
+        if (!src.isDirectory()) {
+            throw new IOException("Expected directory source: " + src);
+        }
+        if (dst.exists()) {
+            throw new IOException("Destination already exists: " + dst);
+        }
+        if (!dst.mkdir()) {
+            throw new IOException("Failed to create snapshot directory: " + dst);
+        }
+
+        File[] children = src.listFiles();
+        if (children == null) {
+            deleteIfExists(dst);
+            throw new IOException("Failed to enumerate directory children for snapshot: " + src);
+        }
+
+        List<File> sortedChildren = new ArrayList<>();
+        Collections.addAll(sortedChildren, children);
+        Collections.sort(sortedChildren, (left, right) -> left.getName().compareTo(right.getName()));
+
+        for (File child : sortedChildren) {
+            File childDst = new File(dst, child.getName());
+            if (child.isDirectory()) {
+                if (!copyDirectorySnapshotRecursive(child, childDst)) {
+                    deleteIfExists(dst);
+                    return false;
+                }
+            } else if (child.isFile()) {
+                copyFileDurably(child, childDst);
+                applyBasicPermissions(child, childDst);
+            } else {
+                deleteIfExists(dst);
+                throw new IOException("Unsupported non-regular path in config tree: "
+                        + child.getAbsolutePath());
+            }
+        }
+
+        applyBasicPermissions(src, dst);
+        if (src.lastModified() > 0) {
+            dst.setLastModified(src.lastModified());
+        }
+        return true;
+    }
+
+    /**
+     * Builds a stable manifest of a directory tree for snapshot verification.
+     *
+     * <p>Each manifest entry includes the relative path plus enough metadata to catch the kinds
+     * of silent drift that matter for config integrity: file-vs-directory shape, file length,
+     * modification time, and a SHA-256 digest for file contents. The resulting list is sorted so
+     * two logically identical trees compare equal regardless of filesystem enumeration order.</p>
+     */
+    private static List<String> describeDirectoryTree(File root) {
+        if (!root.exists() || !root.isDirectory()) {
+            return null;
+        }
+
+        List<String> entries = new ArrayList<>();
+        if (!describeDirectoryTreeRecursive(root, root, entries)) {
+            return null;
+        }
+        Collections.sort(entries);
+        return entries;
+    }
+
+    private static boolean describeDirectoryTreeRecursive(File root, File current, List<String> entries) {
+        String relativePath;
+        if (root.equals(current)) {
+            relativePath = ".";
+        } else {
+            String absoluteRoot = root.getAbsolutePath();
+            String absoluteCurrent = current.getAbsolutePath();
+            relativePath = absoluteCurrent.substring(absoluteRoot.length() + 1)
+                    .replace(File.separatorChar, '/');
+        }
+
+        if (current.isDirectory()) {
+            entries.add("D|" + relativePath + "|" + current.lastModified());
+            File[] children = current.listFiles();
+            if (children == null) {
+                Log.w(TAG, "Failed to enumerate directory while describing snapshot tree: "
+                        + current.getAbsolutePath());
+                return false;
+            }
+
+            List<File> sortedChildren = new ArrayList<>();
+            Collections.addAll(sortedChildren, children);
+            Collections.sort(sortedChildren, (left, right) -> left.getName().compareTo(right.getName()));
+            for (File child : sortedChildren) {
+                if (!describeDirectoryTreeRecursive(root, child, entries)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        if (!current.isFile()) {
+            Log.w(TAG, "Unsupported non-regular path in snapshot tree: " + current.getAbsolutePath());
+            return false;
+        }
+
+        try {
+            entries.add("F|" + relativePath + "|" + current.length() + "|"
+                    + current.lastModified() + "|" + sha256File(current));
+            return true;
+        } catch (IOException e) {
+            Log.w(TAG, "Failed to hash file while describing snapshot tree: "
+                    + current.getAbsolutePath() + " (" + e.getMessage() + ")");
+            return false;
+        }
+    }
+
+    private static String sha256File(File file) throws IOException {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            try (InputStream in = new FileInputStream(file)) {
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = in.read(buffer)) > 0) {
+                    digest.update(buffer, 0, read);
+                }
+            }
+            byte[] hash = digest.digest();
+            StringBuilder sb = new StringBuilder(hash.length * 2);
+            for (byte b : hash) {
+                sb.append(String.format("%02x", b & 0xff));
+            }
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IOException("SHA-256 unavailable", e);
+        }
+    }
+
+    private static void applyBasicPermissions(File src, File dst) {
+        dst.setReadable(src.canRead(), false);
+        dst.setWritable(src.canWrite(), false);
+        dst.setExecutable(src.canExecute(), false);
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -1003,6 +2121,13 @@ public class ProfileSwitcher {
      * atomic rename operation.
      * </p>
      *
+     * <p><b>Audit Fix #10:</b> the method now behaves like an emulator-level transaction.
+     * If any one entry fails after an earlier entry already swapped, RetroDock recovers any
+     * stranded temp files from the failing entry and then rolls the earlier entries back to
+     * their original state. This prevents multi-entry emulators from ending up half docked
+     * and half handheld.
+     * </p>
+     *
      * @param prefs      preferences used for override-aware path resolution and per-entry seeding
      * @param emu        emulator definition whose entries should be swapped
      * @param docked     {@code true} to swap TO docked settings, {@code false} for handheld
@@ -1016,11 +2141,27 @@ public class ProfileSwitcher {
             return false;
         }
 
-        boolean anySwapped = false;
-
+        // Audit Fix #10: Treat multi-entry emulator swaps as one transaction.
+        //
+        // CONCERN: Several emulators have more than one settings entry (for example a main
+        // config file plus an overrides directory). The old code swapped each entry
+        // independently and immediately committed the result. If entry 1 succeeded and entry 2
+        // later failed, the emulator was left in a mixed on-disk state where part of its config
+        // tree was docked and part was handheld.
+        //
+        // FIX: We build a stable per-entry plan first, execute the entries sequentially, and if
+        // any one entry fails we attempt to roll back every earlier entry that already changed.
+        // This gives RetroDock "all or nothing" behavior at the emulator level instead of just
+        // the individual-file level.
+        List<SettingsEntryPlan> plannedEntries = new ArrayList<>();
         for (String relPath : emu.settingsFiles) {
             String resolved = findSettingsFile(prefs, emu, relPath);
             if (resolved == null) {
+                if (isMissingManagedEntry(prefs, emu, relPath)) {
+                    Log.e(TAG, "Aborting swap for " + emu.displayName + " because a previously "
+                            + "managed settings entry disappeared: " + relPath);
+                    return false;
+                }
                 Log.i(TAG, "Settings file not found in any root, skipping: " + relPath);
                 continue;
             }
@@ -1028,32 +2169,111 @@ public class ProfileSwitcher {
             File current = new File(resolved);
             File dockedFile = new File(resolved + ".docked");
             File handheldFile = new File(resolved + ".handheld");
+            boolean hadBackupBeforeSwap = dockedFile.exists() || handheldFile.exists();
 
-            // Once we see either backup variant on disk, that entry has already completed its
-            // first-time bootstrap. We persist that knowledge so a later missing-backup anomaly
-            // does not cause the old global classification hint to be reused incorrectly.
-            if (dockedFile.exists() || handheldFile.exists()) {
-                markEntrySeeded(prefs, emu, relPath);
-            }
-
-            boolean ok;
-            boolean allowClassification = !classified.isEmpty() && !isEntrySeeded(prefs, emu, relPath);
-            if (docked) {
-                // Transitioning TO docked: restore .docked backup as active, save current as .handheld
-                ok = swapSingleEntry(current, dockedFile, handheldFile,
-                        allowClassification ? classified : "", "handheld", "docked");
-            } else {
-                // Transitioning TO handheld: restore .handheld backup as active, save current as .docked
-                ok = swapSingleEntry(current, handheldFile, dockedFile,
-                        allowClassification ? classified : "", "docked", "handheld");
-            }
-            if (ok) {
-                anySwapped = true;
-                markEntrySeeded(prefs, emu, relPath);
-            }
+            plannedEntries.add(new SettingsEntryPlan(
+                    relPath,
+                    current,
+                    dockedFile,
+                    handheldFile,
+                    !classified.isEmpty() && !isEntrySeeded(prefs, emu, relPath),
+                    hadBackupBeforeSwap
+            ));
         }
 
-        return anySwapped;
+        boolean anySwapped = false;
+        List<SettingsEntryPlan> appliedEntries = new ArrayList<>();
+        for (SettingsEntryPlan entry : plannedEntries) {
+            SwapResult result;
+            if (docked) {
+                // Transitioning TO docked: restore .docked backup as active, save current as .handheld
+                result = swapSingleEntry(entry.current, entry.dockedBackup, entry.handheldBackup,
+                        entry.allowClassification ? classified : "", "handheld", "docked");
+            } else {
+                // Transitioning TO handheld: restore .handheld backup as active, save current as .docked
+                result = swapSingleEntry(entry.current, entry.handheldBackup, entry.dockedBackup,
+                        entry.allowClassification ? classified : "", "docked", "handheld");
+            }
+
+            if (result == SwapResult.SWAPPED) {
+                anySwapped = true;
+                appliedEntries.add(entry);
+                continue;
+            }
+            if (result == SwapResult.NO_OP) {
+                continue;
+            }
+
+            // Stabilize any stranded temp files from the failing entry first, then try to undo
+            // every earlier entry that already swapped. Running recovery before and after the
+            // rollback keeps named temps from being mistaken for completed entries.
+            recoverFromPartialSwap(prefs, emu);
+            if (!rollbackAppliedEntries(appliedEntries, docked)) {
+                Log.e(TAG, "CRITICAL: rollback failed after a multi-entry swap error for "
+                        + emu.displayName + ". Emulator may need manual verification.");
+            }
+            recoverFromPartialSwap(prefs, emu);
+            return false;
+        }
+
+        if (!anySwapped) {
+            return false;
+        }
+
+        // Commit the bootstrap/seeded markers only after the full emulator transaction has
+        // succeeded. Marking an entry as seeded before the transaction commits would make a
+        // later rollback look like a completed first-time swap, which would suppress the
+        // classification hint for that entry the next time it appears.
+        for (SettingsEntryPlan entry : plannedEntries) {
+            if (entry.hadBackupBeforeSwap || appliedEntries.contains(entry)) {
+                markEntrySeeded(prefs, emu, entry.relPath);
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Returns {@code true} when an entry looks like RetroDock had previously been managing it,
+     * but the operational resolver can no longer find a safe path for it.
+     *
+     * <p>This is treated as a hard failure for multi-entry swaps. Silently skipping a missing
+     * previously-managed entry would let the rest of the emulator swap continue, producing the
+     * same mixed-profile state this transaction logic is trying to prevent.</p>
+     */
+    private static boolean isMissingManagedEntry(SharedPreferences prefs, EmulatorConfig emu, String relPath) {
+        if (!getOverridePath(prefs, emu, relPath).isEmpty()) {
+            return true;
+        }
+        return !prefs.getString(buildResolvedPathKey(emu.id, relPath), "").isEmpty();
+    }
+
+    /**
+     * Rolls back previously-swapped entries in reverse order after a later entry fails.
+     *
+     * <p>We reverse the original dock direction so every entry is restored to the exact state it
+     * had before the transaction started. Reverse-order rollback is the safest choice because it
+     * mirrors normal transaction unwinding: the most recently changed entry is undone first.</p>
+     */
+    private static boolean rollbackAppliedEntries(List<SettingsEntryPlan> appliedEntries, boolean docked) {
+        boolean allRolledBack = true;
+        for (int i = appliedEntries.size() - 1; i >= 0; i--) {
+            SettingsEntryPlan entry = appliedEntries.get(i);
+            SwapResult rollback;
+            if (docked) {
+                rollback = swapSingleEntry(entry.current, entry.handheldBackup, entry.dockedBackup,
+                        "", "docked", "handheld");
+            } else {
+                rollback = swapSingleEntry(entry.current, entry.dockedBackup, entry.handheldBackup,
+                        "", "handheld", "docked");
+            }
+
+            if (rollback != SwapResult.SWAPPED) {
+                allRolledBack = false;
+                Log.e(TAG, "Rollback failed for " + entry.current.getAbsolutePath()
+                        + " (result=" + rollback + ")");
+            }
+        }
+        return allRolledBack;
     }
 
     /**
@@ -1089,10 +2309,12 @@ public class ProfileSwitcher {
      *                       (e.g. "handheld" when docking)
      * @param classifyLabel  label for logging the first-time swap direction (unused in logic,
      *                       included for symmetry)
-     * @return {@code true} if the swap (or first-time rename) succeeded
+     * @return {@link SwapResult#SWAPPED} if bytes were moved, {@link SwapResult#NO_OP} if the
+     *         entry did not need any action right now, or {@link SwapResult#FAILED} if a
+     *         filesystem operation failed
      */
-    private static boolean swapSingleEntry(File current, File targetBackup, File saveBackup,
-                                           String classified, String classifyMatch, String classifyLabel) {
+    private static SwapResult swapSingleEntry(File current, File targetBackup, File saveBackup,
+                                              String classified, String classifyMatch, String classifyLabel) {
         // --- Scenario 1 & 2: A target backup exists and can be restored ---
         if (targetBackup.exists()) {
             if (current.exists()) {
@@ -1108,7 +2330,7 @@ public class ProfileSwitcher {
                 // to copy+delete on FUSE filesystems where rename can fail.
                 if (!moveWithFallback(current, temp)) {
                     Log.e(TAG, "Step 1 failed: could not move current to temp: " + current);
-                    return false;
+                    return SwapResult.FAILED;
                 }
                 // Step 2: Move target backup into the active position.
                 //
@@ -1144,7 +2366,7 @@ public class ProfileSwitcher {
                                 + "config is stranded at: " + temp.getAbsolutePath()
                                 + " — recovery will restore it on next run");
                     }
-                    return false;
+                    return SwapResult.FAILED;
                 }
                 // Step 3: Rename temp (old active) to the opposite backup slot.
                 //
@@ -1161,10 +2383,10 @@ public class ProfileSwitcher {
                 // Scenario 2: No active file exists, just restore the backup directly
                 if (!moveWithFallback(targetBackup, current)) {
                     Log.e(TAG, "Failed to restore target: " + targetBackup);
-                    return false;
+                    return SwapResult.FAILED;
                 }
             }
-            return true;
+            return SwapResult.SWAPPED;
         }
 
         // --- Scenario 3: First-time swap via classification ---
@@ -1177,14 +2399,14 @@ public class ProfileSwitcher {
             Log.i(TAG, "First swap: renaming " + current.getName() + " to ." + classifyMatch);
             if (!moveWithFallback(current, saveBackup)) {
                 Log.e(TAG, "Failed to move for first swap: " + current);
-                return false;
+                return SwapResult.FAILED;
             }
-            return true;
+            return SwapResult.SWAPPED;
         }
 
         // --- No swap possible: no backup exists and no classification applies ---
         Log.i(TAG, "No backup exists yet for: " + current.getAbsolutePath());
-        return false;
+        return SwapResult.NO_OP;
     }
 
     // ==================================================================================
@@ -1193,41 +2415,36 @@ public class ProfileSwitcher {
 
     /**
      * Moves a file or directory from {@code src} to {@code dst}, falling back to a
-     * recursive copy + delete if {@link File#renameTo} fails.
+     * crash-safe file copy + delete only when a direct move is unavailable.
      *
      * <h3>Why this is needed</h3>
      * <p>On Android 11+ with scoped storage, many paths are backed by FUSE (Filesystem in
-     * Userspace). FUSE translates {@code rename(2)} into copy+delete internally, and this
-     * translation can fail for various reasons (cross-mount moves, permission issues,
-     * partial FUSE support). When {@code renameTo()} fails, we fall back to a manual
-     * byte-level copy followed by a recursive delete of the source.</p>
+     * Userspace). A same-directory rename normally remains the safest operation because it keeps
+     * the config tree intact and avoids exposing any partially-written destination. Unfortunately,
+     * Java's classic {@link File#renameTo} can fail on some Android/FUSE combinations even when
+     * a kernel-level move would still be possible. We therefore try multiple direct move APIs
+     * first ({@link Files#move} with and without {@code ATOMIC_MOVE}, then {@code renameTo()})
+     * before considering any copy-based fallback.</p>
      *
      * <h3>CONCERN: Config file integrity during moves</h3>
-     * <p>This method is the foundation of every settings swap in RetroDock. If it fails
-     * or behaves incorrectly, the user's emulator config files could be corrupted, lost,
-     * or left in an inconsistent state. The previous implementation used bare
-     * {@link File#renameTo} with no fallback — on FUSE filesystems, this silently failed
-     * and the swap was quietly skipped, leaving the user with the wrong profile active
-     * and no indication that anything went wrong.</p>
+     * <p>This helper is the foundation of every profile swap. The old copy+delete fallback
+     * treated files and directories the same, which turned out to be too risky for directory
+     * trees. If a directory copy succeeded but the source delete only partially succeeded, the
+     * next swap step could copy the opposite profile into a destination directory that still
+     * contained leftover files from the original profile. That created a merged, mixed-profile
+     * config tree -- valid enough to exist on disk, but semantically corrupted.</p>
      *
      * <h3>Safety guarantees (how the fix protects config files)</h3>
      * <ol>
-     *   <li><b>Destination is fully written before source is deleted:</b>
-     *       {@link #copyRecursive} completes the entire copy (all files, all bytes)
-     *       before {@link #deleteRecursive} touches the source. There is no window
-     *       where data exists in neither location.</li>
-     *   <li><b>Copy failure leaves source intact:</b> If {@code copyRecursive()} throws
-     *       an {@link IOException} at any point (disk full, permission denied, I/O error),
-     *       the exception bypasses the {@code deleteRecursive(src)} call. The source
-     *       file/directory remains completely untouched.</li>
-     *   <li><b>Partial destination is cleaned up:</b> On copy failure, the catch block
-     *       calls {@code deleteRecursive(dst)} to remove any partially-written files,
-     *       preventing corrupt half-copies from confusing future swap attempts or
-     *       emulator launches.</li>
-     *   <li><b>Timestamps are preserved:</b> {@code copyRecursive()} calls
-     *       {@link File#setLastModified} on every copied entry, so emulators that use
-     *       modification times for cache invalidation or reload detection see the
-     *       same timestamps as the original files.</li>
+     *   <li><b>Destination must be absent:</b> We now refuse to move onto an existing path.
+     *       This prevents directory merges and surfaces state drift immediately.</li>
+     *   <li><b>Directories never use copy+delete fallback:</b> If every direct move API fails
+     *       for a directory, the swap fails closed instead of attempting a risky emulated move.</li>
+     *   <li><b>Files use a durable copy fallback:</b> For regular files only, we copy bytes to a
+     *       staging file, {@code fsync()} them, move the staged copy into place, and only then
+     *       delete the source. This preserves data even on FUSE-backed storage.</li>
+     *   <li><b>Source mutation during fallback is detected:</b> If the source file changes while
+     *       we are copying it, the fallback aborts rather than claiming success for a stale copy.</li>
      * </ol>
      *
      * @param src the source file or directory to move
@@ -1235,125 +2452,166 @@ public class ProfileSwitcher {
      * @return {@code true} if the move succeeded via either rename or copy+delete
      */
     private static boolean moveWithFallback(File src, File dst) {
-        // Fast path: atomic rename (works on most local filesystems)
-        if (src.renameTo(dst)) {
+        if (!src.exists()) {
+            Log.e(TAG, "moveWithFallback: source does not exist: " + src.getAbsolutePath());
+            return false;
+        }
+        if (dst.exists()) {
+            Log.e(TAG, "moveWithFallback: refusing to overwrite existing destination: "
+                    + dst.getAbsolutePath());
+            return false;
+        }
+
+        // Fast path: direct move. We try the modern NIO move APIs first because they can succeed
+        // on some Android/FUSE combinations where the legacy File.renameTo() reports failure.
+        if (moveDirectly(src, dst)) {
             return true;
         }
 
-        // Slow path: copy + delete (needed on FUSE-mounted storage)
-        Log.w(TAG, "renameTo failed for " + src.getName() + ", falling back to copy+delete");
-        try {
-            copyRecursive(src, dst);
+        // Audit Fix #11: Directory copy+delete fallback was removed on purpose.
+        //
+        // CONCERN: Recursive copy+delete cannot provide the same integrity guarantees as a real
+        // rename for config directories. If even one source child fails to delete, the next swap
+        // step can merge profiles together. Because the user's saved config tree matters more than
+        // "always swap no matter what", the safe behavior is to fail closed here.
+        if (src.isDirectory()) {
+            Log.e(TAG, "Direct directory move failed and copy+delete fallback is disabled for "
+                    + "safety: " + src.getAbsolutePath());
+            return false;
+        }
 
-            // CONCERN (Audit Fix #3): If the copy succeeds but the delete partially fails,
-            // we now have TWO copies of the same config data — the original source and the
-            // new destination. The previous code returned true unconditionally after calling
-            // deleteRecursive(), even if the source was only partially deleted. This violated
-            // the invariant that a config should only exist in one location, and could cause
-            // the next swap to operate on stale data or confuse recovery logic.
-            //
-            // FIX: Check whether deleteRecursive fully succeeded. If the source was only
-            // partially deleted (some files remain), log a warning but still return true —
-            // the destination IS complete and correct. The leftover source fragments are
-            // orphans that won't be mistaken for a valid config because the destination
-            // already exists at the expected path. Recovery and future swaps will operate
-            // on the destination, ignoring the partial source.
-            if (!deleteRecursive(src)) {
-                Log.w(TAG, "moveWithFallback: copy succeeded but source was only partially "
-                        + "deleted (some files may be locked). Destination is complete: " + dst
-                        + ". Orphaned source fragments at: " + src);
-                // Still return true — the move's essential purpose (putting data at dst) succeeded.
-                // The orphaned source fragments are a minor leak, not a correctness issue.
+        // Slow path for FILES ONLY: durable copy to a staging file, then expose the destination.
+        Log.w(TAG, "Direct file move failed for " + src.getName()
+                + ", falling back to staged copy+delete");
+        File stagedCopy = new File(dst.getAbsolutePath() + FILE_COPY_STAGING_SUFFIX + "." + System.nanoTime());
+        try {
+            copyFileDurably(src, stagedCopy);
+            if (!moveDirectly(stagedCopy, dst)) {
+                Log.e(TAG, "moveWithFallback: failed to expose staged copy at destination: "
+                        + dst.getAbsolutePath());
+                stagedCopy.delete();
+                return false;
             }
+
+            // Only after the destination is fully durable and visible do we delete the source.
+            // If source deletion fails for a regular file, the source copy is still intact, so we
+            // can safely remove the destination and report failure instead of pretending the move
+            // completed. That keeps the caller from building a transaction on top of a duplicate.
+            if (!src.delete()) {
+                Log.e(TAG, "moveWithFallback: copied file but could not delete source: "
+                        + src.getAbsolutePath());
+                if (dst.exists() && !dst.delete()) {
+                    File quarantine = buildQuarantineTarget(dst);
+                    if (moveDirectly(dst, quarantine)) {
+                        Log.e(TAG, "moveWithFallback: moved duplicate destination out of the live "
+                                + "namespace after source delete failure: " + quarantine.getAbsolutePath());
+                    } else {
+                        Log.e(TAG, "moveWithFallback: FAILED to clean up duplicate destination after "
+                                + "source delete failure: " + dst.getAbsolutePath());
+                    }
+                }
+                return false;
+            }
+
             return true;
         } catch (IOException e) {
             Log.e(TAG, "Copy fallback failed: " + src + " -> " + dst + ": " + e.getMessage());
-            // Clean up partial destination to avoid leaving corrupt state.
-            // We don't check the return value here because the copy already failed —
-            // partial cleanup is best-effort, and the source is still intact.
-            deleteRecursive(dst);
+            stagedCopy.delete();
             return false;
         }
     }
 
     /**
-     * Recursively copies a file or directory tree from {@code src} to {@code dst},
-     * preserving last-modified timestamps on every entry.
+     * Tries every direct move API available to us, from strongest semantics to weakest.
      *
-     * <p>For files, copies byte-by-byte with an 8KB buffer using try-with-resources
-     * to guarantee both streams are closed even on I/O errors. For directories,
-     * creates the destination directory and recursively copies each child entry.</p>
-     *
-     * <h3>FIX: Timestamp preservation</h3>
-     * <p><b>Concern:</b> When {@link #moveWithFallback} falls back to copy+delete
-     * (because {@code renameTo()} failed on a FUSE filesystem), the copied files
-     * receive the current wall-clock time as their last-modified timestamp. This is
-     * a problem because several emulators use file modification timestamps for cache
-     * invalidation, config reload detection, or freshness checks. For example:</p>
-     * <ul>
-     *   <li>RetroArch's config directory may use timestamps to detect changed overrides</li>
-     *   <li>DuckStation checks INI modification times before deciding to re-parse</li>
-     *   <li>ScummVM can re-read its config when it detects a timestamp change</li>
-     * </ul>
-     * <p>If a profile swap silently bumps every file's timestamp to "now", the
-     * emulator may unnecessarily reload configs on next launch, or worse, it may
-     * treat unchanged settings as new and overwrite them on exit — destroying the
-     * backup profile that was just swapped in.</p>
-     *
-     * <p><b>Fix:</b> After copying each entry (file or directory), we call
-     * {@link File#setLastModified} to restore the original source timestamp. This
-     * makes the copy+delete fallback behave identically to an atomic rename from
-     * the emulator's perspective — the file contents AND metadata are preserved.</p>
-     *
-     * <h3>Failure safety</h3>
-     * <p>If this method throws {@link IOException} partway through a directory copy,
-     * the caller ({@link #moveWithFallback}) catches the exception, deletes the
-     * partial destination via {@link #deleteRecursive}, and returns {@code false}.
-     * The source is never deleted on copy failure, so no data is lost.</p>
-     *
-     * @throws IOException if any file cannot be read or written
+     * <p>{@code ATOMIC_MOVE} is ideal when supported because the source and destination switch in
+     * one kernel operation. Plain {@code Files.move()} is still preferable to a manual copy
+     * because the filesystem, not RetroDock, owns the move semantics. {@code renameTo()} is kept
+     * as a final compatibility fallback because some Android builds wire it up differently.</p>
      */
-    private static void copyRecursive(File src, File dst) throws IOException {
-        if (src.isDirectory()) {
-            if (!dst.mkdirs() && !dst.isDirectory()) {
-                throw new IOException("Failed to create directory: " + dst);
-            }
-            File[] children = src.listFiles();
-            if (children != null) {
-                for (File child : children) {
-                    copyRecursive(child, new File(dst, child.getName()));
-                }
-            }
-        } else {
-            // Copy file contents with buffered streams.
-            // try-with-resources guarantees both streams close even if write() throws,
-            // preventing file descriptor leaks during the FUSE fallback path.
-            try (InputStream in = new FileInputStream(src);
-                 OutputStream out = new FileOutputStream(dst)) {
-                byte[] buf = new byte[8192];
-                int len;
-                while ((len = in.read(buf)) > 0) {
-                    out.write(buf, 0, len);
-                }
-            }
+    private static boolean moveDirectly(File src, File dst) {
+        try {
+            Files.move(src.toPath(), dst.toPath(), StandardCopyOption.ATOMIC_MOVE);
+            return true;
+        } catch (Exception ignored) {
+        }
+        try {
+            Files.move(src.toPath(), dst.toPath());
+            return true;
+        } catch (Exception ignored) {
+        }
+        return src.renameTo(dst);
+    }
+
+    /**
+     * Copies one regular file to a staging location and forces the bytes to stable storage.
+     *
+     * <p>This method intentionally refuses directory input. Directory-tree copies were the
+     * source of the mixed-profile corruption risk described above, so only regular files are
+     * eligible for manual fallback now.</p>
+     *
+     * <h3>How this protects emulator configs</h3>
+     * <ul>
+     *   <li><b>Durability before source deletion:</b> the destination file descriptor is synced
+     *       before the caller is allowed to remove the source.</li>
+     *   <li><b>Source-change detection:</b> the source size and timestamp are sampled before the
+     *       copy and rechecked after it completes. If the source changed mid-copy, we abort
+     *       instead of publishing a stale or torn duplicate.</li>
+     *   <li><b>Metadata preservation:</b> the original last-modified timestamp is restored on the
+     *       staging copy so file-based emulators do not misinterpret the fallback as a fresh edit.</li>
+     * </ul>
+     */
+    private static void copyFileDurably(File src, File dst) throws IOException {
+        if (!src.isFile()) {
+            throw new IOException("copyFileDurably only supports regular files: " + src);
+        }
+        if (dst.exists()) {
+            throw new IOException("Destination already exists: " + dst);
         }
 
-        // FIX: Restore the original last-modified timestamp on the destination.
-        //
-        // Without this, every file touched by a FUSE-fallback move would get a fresh
-        // timestamp of "now", even though its contents are identical to the source.
-        // Emulators that check modification times (RetroArch, DuckStation, ScummVM)
-        // could misinterpret the timestamp jump as "config was edited externally" and
-        // trigger unwanted behavior (config reloads, cache invalidation, or overwrite
-        // on exit). Preserving the original timestamp makes the copy+delete path
-        // indistinguishable from an atomic rename from the emulator's perspective.
-        //
-        // The guard (lastModified > 0) skips the call if the source has no timestamp
-        // metadata, which can happen on some virtual filesystems.
-        long lastModified = src.lastModified();
-        if (lastModified > 0) {
-            dst.setLastModified(lastModified);
+        long originalSize = src.length();
+        long originalLastModified = src.lastModified();
+        boolean originalReadable = src.canRead();
+        boolean originalWritable = src.canWrite();
+        boolean originalExecutable = src.canExecute();
+
+        try (InputStream in = new FileInputStream(src);
+             FileOutputStream out = new FileOutputStream(dst)) {
+            byte[] buf = new byte[8192];
+            int len;
+            while ((len = in.read(buf)) > 0) {
+                out.write(buf, 0, len);
+            }
+            out.getFD().sync();
+        } catch (IOException copyFailure) {
+            dst.delete();
+            throw copyFailure;
         }
+
+        if (src.length() != originalSize || src.lastModified() != originalLastModified) {
+            dst.delete();
+            throw new IOException("Source changed while file fallback copy was in progress: " + src);
+        }
+        if (dst.length() != originalSize) {
+            dst.delete();
+            throw new IOException("Copied file length mismatch for: " + src);
+        }
+
+        if (originalLastModified > 0) {
+            dst.setLastModified(originalLastModified);
+        }
+        dst.setReadable(originalReadable, false);
+        dst.setWritable(originalWritable, false);
+        dst.setExecutable(originalExecutable, false);
+    }
+
+    private static File buildQuarantineTarget(File originalPath) {
+        File quarantine = new File(originalPath.getAbsolutePath() + QUARANTINE_SUFFIX);
+        if (quarantine.exists()) {
+            quarantine = new File(originalPath.getAbsolutePath() + QUARANTINE_SUFFIX
+                    + "." + System.currentTimeMillis());
+        }
+        return quarantine;
     }
 
     /**

@@ -14,18 +14,22 @@ import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileOutputStream;
-import java.io.FileReader;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
+import java.io.StringReader;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 
 /**
  * Hot-applies emulator-specific settings (primarily shaders and scalers) to running emulators
@@ -102,12 +106,9 @@ public class EmulatorHotApply {
     /** Shader preset file extensions in priority order (modern Vulkan first). */
     private static final String[] SHADER_EXTENSIONS = {".slangp", ".glslp", ".cgp"};
 
-    /** RetroArch root paths — must match EmulatorConfig's database entry. */
-    private static final String[] RETROARCH_ROOTS = {
-            "/storage/emulated/0/RetroArch",
-            "/storage/emulated/0/Android/data/com.retroarch/files",
-            "/storage/emulated/0/Android/data/com.retroarch.aarch64/files"
-    };
+    /** Maximum number of times a hot-apply rewrite will re-read and retry after detecting
+     * that the emulator changed the config file underneath us. */
+    private static final int HOT_APPLY_MAX_RETRIES = 3;
 
     /**
      * Lock object for INI file editing operations.
@@ -130,21 +131,23 @@ public class EmulatorHotApply {
      *   <li>RetroDock writes its modified version back — overwriting the emulator's change</li>
      * </ol>
      *
-     * <p><b>Why this cannot be fully fixed:</b> There is no cross-process file locking API
+     * <p><b>Why this cannot be fully eliminated:</b> There is no cross-process file locking API
      * available on Android that both RetroDock and arbitrary emulators would honor. The
      * emulators are third-party applications with no knowledge of RetroDock's lock.</p>
      *
-     * <p><b>Why this is acceptable:</b> Hot-apply only modifies specific shader/filter
-     * settings (a tiny subset of the full config). The chance of an emulator writing to the
-     * exact same file in the ~1ms window between RetroDock's read and write is very low.
-     * Furthermore, hot-apply changes are temporary — they affect the running session only.
-     * The permanent settings swap happens via {@link ProfileSwitcher} after the emulator
-     * exits, when there is no concurrent writer.</p>
+     * <p><b>What we do now instead:</b> each edit captures a content hash of the original file,
+     * writes the replacement to a temp file, then re-checks the live file just before the atomic
+     * replace. If the emulator changed the file in the meantime, RetroDock aborts and retries from
+     * the new on-disk version instead of blindly overwriting it with a stale snapshot. This does
+     * not create a perfect lock, but it turns silent lost updates into an explicit retry/abort
+     * path, which is much safer for user configs.</p>
      *
      * <p><b>Mitigations in place:</b></p>
      * <ul>
      *   <li>{@link #writeLinesAtomically} minimizes the window by using temp-file-then-move
      *       instead of direct truncation</li>
+     *   <li>{@link #rewriteTextConfig} detects stale snapshots and retries from the emulator's
+     *       newest on-disk version instead of overwriting blindly</li>
      *   <li>The {@link #HOT_APPLY_DELAY_MS} delay gives the emulator time to finish its own
      *       post-dock writes before RetroDock touches the file</li>
      *   <li>The INI_LOCK serializes RetroDock's own threads so at least our writes don't
@@ -152,6 +155,49 @@ public class EmulatorHotApply {
      * </ul>
      */
     private static final Object INI_LOCK = new Object();
+
+    /**
+     * Immutable snapshot of a text config file at one instant in time.
+     *
+     * <p>Hot-apply needs two views of the original file:
+     * <ul>
+     *   <li>The parsed text lines so we can surgically edit keys/sections.</li>
+     *   <li>A cryptographic digest of the raw bytes so we can detect whether the emulator wrote
+     *       a newer version before our atomic replace.</li>
+     * </ul>
+     * Keeping those together prevents the "read one version, compare against another" bug class.</p>
+     */
+    private static final class ConfigFileSnapshot {
+        final List<String> lines;
+        final byte[] sha256;
+        final long size;
+        final long lastModified;
+
+        ConfigFileSnapshot(List<String> lines, byte[] sha256, long size, long lastModified) {
+            this.lines = lines;
+            this.sha256 = sha256;
+            this.size = size;
+            this.lastModified = lastModified;
+        }
+    }
+
+    /**
+     * Signals that the emulator changed the config file after RetroDock read it but before
+     * RetroDock could safely replace it.
+     *
+     * <p>This is not treated as a generic I/O error because the safest response is to retry from
+     * the emulator's newest version, not to log a permanent failure immediately.</p>
+     */
+    private static final class StaleConfigSnapshotException extends IOException {
+        StaleConfigSnapshotException(String message) {
+            super(message);
+        }
+    }
+
+    /** Functional interface used by the optimistic-concurrency rewrite helper. */
+    private interface ConfigTransformer {
+        List<String> transform(List<String> lines) throws IOException;
+    }
 
     /**
      * Tracks pending delayed hot-apply runnables by emulator ID.
@@ -169,6 +215,75 @@ public class EmulatorHotApply {
      * {@link Handler#removeCallbacks(Runnable)}.</p>
      */
     private static final Map<String, Runnable> pendingHotApply = new HashMap<>();
+
+    /**
+     * Resolves the exact settings path RetroDock should hot-apply against for a built-in emulator.
+     *
+     * <p><b>Why this matters:</b> the swap engine and the hot-apply engine must agree on the same
+     * physical file. If hot-apply edits one config while the swap engine manages another, the user
+     * ends up with seemingly random persistence behavior: the running emulator sees one file, while
+     * the next dock/undock swap manipulates a different one. We therefore delegate path resolution
+     * to {@link ProfileSwitcher#findSettingsFile(SharedPreferences, EmulatorConfig, String)} so
+     * hot-apply uses the same override-aware, cache-aware resolver as the swap engine.</p>
+     */
+    private static String findManagedSettingsPath(Context ctx, String emuId, String relPath) {
+        EmulatorConfig emu = findKnownEmulator(emuId);
+        if (emu == null) {
+            Log.w(TAG, "No built-in emulator definition found for hot-apply id: " + emuId);
+            return null;
+        }
+        SharedPreferences prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        return ProfileSwitcher.findSettingsFile(prefs, emu, relPath);
+    }
+
+    private static EmulatorConfig findKnownEmulator(String emuId) {
+        for (EmulatorConfig emu : EmulatorConfig.getKnownDatabase()) {
+            if (emu.id.equals(emuId)) {
+                return emu;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Prepares RetroDock's trusted rollback snapshot before any live hot-apply.
+     *
+     * <p>Hot-apply is convenient, but once RetroDock changes a running emulator's live state the
+     * currently mounted config file is no longer a trustworthy "latest saved profile". The
+     * emulator may keep writing temporary session edits into that mounted file until it exits.
+     * To prevent those temporary edits from being mislabeled as the new handheld or docked
+     * profile, ProfileSwitcher snapshots the mounted profile immediately before the first live
+     * change of the session. If that snapshot cannot be created safely, we refuse the live edit.</p>
+     */
+    private static boolean prepareTrackedHotApply(Context ctx, String emuId, String label) {
+        if (ProfileSwitcher.ensureHotSwapSessionPrepared(ctx, emuId)) {
+            return true;
+        }
+
+        Log.w(TAG, label + " hot-apply skipped because RetroDock could not prepare a trusted "
+                + "pre-hot-swap rollback snapshot");
+        return false;
+    }
+
+    /**
+     * Finalizes session tracking after one live hot-apply attempt.
+     *
+     * <p>A successful live operation marks the session untrusted, meaning the mounted config must
+     * be restored from the trusted snapshot on emulator exit before any real docked/handheld swap
+     * is allowed to save. A failed operation does the opposite: if no prior hot-apply already
+     * marked the session untrusted, the prepared snapshot is discarded so abandoned attempts do
+     * not cause later clean exits to throw away valid user edits.</p>
+     */
+    private static void finishTrackedHotApply(Context ctx, String emuId, boolean applied, String label) {
+        if (applied) {
+            ProfileSwitcher.markHotSwapSessionApplied(ctx, emuId);
+            return;
+        }
+
+        ProfileSwitcher.discardPreparedHotSwapSessionIfUnused(ctx, emuId);
+        Log.w(TAG, label + " hot-apply did not complete, so the prepared trusted-session "
+                + "snapshot was discarded");
+    }
 
     /**
      * Handler used for scheduling delayed hot-apply operations.
@@ -272,22 +387,32 @@ public class EmulatorHotApply {
             // shader presets that will be swapped in after RetroArch exits). Per-core and
             // per-game shader presets are handled automatically by the full config/ directory
             // swap on exit — hot-apply only needs the global preset for an immediate change.
-            String configDir = ProfileSwitcher.findSettingsFile(RETROARCH_ROOTS, "config");
+            String configDir = findManagedSettingsPath(ctx, "retroarch", "config");
             if (configDir == null) {
                 Log.w(TAG, "RetroArch config dir not found, skipping shader hot-apply");
                 return;
             }
 
+            if (!prepareTrackedHotApply(ctx, "retroarch", "RetroArch")) {
+                return;
+            }
+
             String shaderPath = findGlobalShaderPreset(configDir, docked);
+            boolean applied;
             if (shaderPath != null) {
-                sendUdpCommand("SET_SHADER " + shaderPath);
-                Log.i(TAG, "RetroArch hot-apply: SET_SHADER " + shaderPath);
+                applied = sendUdpCommand("SET_SHADER " + shaderPath);
+                if (applied) {
+                    Log.i(TAG, "RetroArch hot-apply: SET_SHADER " + shaderPath);
+                }
             } else {
                 // No global shader preset in the backup dir — disable shaders.
                 // SET_SHADER with no argument is idempotent and safe.
-                sendUdpCommand("SET_SHADER");
-                Log.i(TAG, "RetroArch hot-apply: no shader preset found in backup, disabling shaders");
+                applied = sendUdpCommand("SET_SHADER");
+                if (applied) {
+                    Log.i(TAG, "RetroArch hot-apply: no shader preset found in backup, disabling shaders");
+                }
             }
+            finishTrackedHotApply(ctx, "retroarch", applied, "RetroArch");
         });
     }
 
@@ -328,8 +453,10 @@ public class EmulatorHotApply {
      * to {@code 127.0.0.1} on port {@value #RETROARCH_CMD_PORT}. The socket has a 1-second
      * timeout to avoid blocking indefinitely if RetroArch is not listening.</p>
      *
-     * <p>This runs on a dedicated background thread to avoid blocking the caller, since
-     * network I/O (even localhost UDP) is not permitted on Android's main thread.</p>
+     * <p>This method runs synchronously on the background worker thread created by
+     * {@link #scheduleDelayed}. Keeping the send synchronous lets the caller know whether the
+     * live command really left the process, which in turn determines whether the current emulator
+     * session must be marked "untrusted" and later restored from its trusted snapshot.</p>
      *
      * <p>Known RetroArch UDP commands used by RetroDock:</p>
      * <ul>
@@ -338,37 +465,38 @@ public class EmulatorHotApply {
      * </ul>
      *
      * @param command the command string to send (without trailing newline; one is appended)
+     * @return {@code true} if the UDP packet was sent successfully, {@code false} otherwise
      */
-    private static void sendUdpCommand(String command) {
-        new Thread(() -> {
-            // FIX: DatagramSocket resource leak
-            //
-            // CONCERN: The previous implementation created the DatagramSocket and called
-            // socket.close() manually after socket.send(). If send() threw an exception
-            // (e.g., network error, SecurityException, or any RuntimeException), the close()
-            // call was skipped entirely. Each leaked DatagramSocket holds an underlying
-            // native file descriptor (a UDP socket in the OS kernel). On Android, each
-            // process is limited to ~1024 file descriptors. In a pathological scenario —
-            // say, the user rapidly docks/undocks dozens of times while RetroArch's network
-            // command port is unreachable — enough sockets could leak to exhaust the
-            // process's file descriptor limit, causing unrelated operations (file reads,
-            // database access, UI rendering) to fail with "Too many open files" errors.
-            //
-            // FIX: Wrap the socket in a try-with-resources block. Java's AutoCloseable
-            // contract guarantees that the socket is closed when the block exits, whether
-            // normally or via an exception. This is the standard idiom for any resource
-            // that implements Closeable/AutoCloseable.
-            try (DatagramSocket socket = new DatagramSocket()) {
-                socket.setSoTimeout(1000);
-                byte[] data = (command + "\n").getBytes("UTF-8");
-                InetAddress addr = InetAddress.getByName("127.0.0.1");
-                DatagramPacket packet = new DatagramPacket(data, data.length, addr, RETROARCH_CMD_PORT);
-                socket.send(packet);
-                Log.i(TAG, "Sent RetroArch UDP command: " + command);
-            } catch (Exception e) {
-                Log.w(TAG, "Failed to send RetroArch UDP: " + e.getMessage());
-            }
-        }, "RetroArchCmd").start();
+    private static boolean sendUdpCommand(String command) {
+        // FIX: DatagramSocket resource leak
+        //
+        // CONCERN: The previous implementation created the DatagramSocket and called
+        // socket.close() manually after socket.send(). If send() threw an exception
+        // (e.g., network error, SecurityException, or any RuntimeException), the close()
+        // call was skipped entirely. Each leaked DatagramSocket holds an underlying
+        // native file descriptor (a UDP socket in the OS kernel). On Android, each
+        // process is limited to ~1024 file descriptors. In a pathological scenario —
+        // say, the user rapidly docks/undocks dozens of times while RetroArch's network
+        // command port is unreachable — enough sockets could leak to exhaust the
+        // process's file descriptor limit, causing unrelated operations (file reads,
+        // database access, UI rendering) to fail with "Too many open files" errors.
+        //
+        // FIX: Wrap the socket in a try-with-resources block. Java's AutoCloseable
+        // contract guarantees that the socket is closed when the block exits, whether
+        // normally or via an exception. This is the standard idiom for any resource
+        // that implements Closeable/AutoCloseable.
+        try (DatagramSocket socket = new DatagramSocket()) {
+            socket.setSoTimeout(1000);
+            byte[] data = (command + "\n").getBytes("UTF-8");
+            InetAddress addr = InetAddress.getByName("127.0.0.1");
+            DatagramPacket packet = new DatagramPacket(data, data.length, addr, RETROARCH_CMD_PORT);
+            socket.send(packet);
+            Log.i(TAG, "Sent RetroArch UDP command: " + command);
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to send RetroArch UDP: " + e.getMessage());
+            return false;
+        }
     }
 
     // =====================================================================
@@ -446,9 +574,14 @@ public class EmulatorHotApply {
             String chainKey = docked ? "duckstation_shaders_docked" : "duckstation_shaders_handheld";
             String shaderChain = prefs.getString(chainKey, "");
 
+            if (!prepareTrackedHotApply(ctx, "duckstation", "DuckStation")) {
+                return;
+            }
+
             // Rewrite the entire [PostProcessing] section with the new shader chain
             boolean modified = modifyIniSection(settingsPath, "PostProcessing", buildDuckStationShaderEntries(shaderChain));
             if (modified) {
+                finishTrackedHotApply(ctx, "duckstation", true, "DuckStation");
                 Log.i(TAG, "DuckStation hot-apply: updated PostProcessing in settings.ini");
 
                 // Attempt to trigger an immediate reload via Android keyevent.
@@ -461,6 +594,8 @@ public class EmulatorHotApply {
                 } else {
                     Log.i(TAG, "DuckStation hot-apply: no reload keycode configured, shader will apply on next restart");
                 }
+            } else {
+                finishTrackedHotApply(ctx, "duckstation", false, "DuckStation");
             }
         });
     }
@@ -468,34 +603,15 @@ public class EmulatorHotApply {
     /**
      * Locates DuckStation's {@code settings.ini} file on the filesystem.
      *
-     * <p>Checks the following locations in order:</p>
-     * <ol>
-     *   <li>User-configured override path from SharedPreferences
-     *       (key: {@code emu_duckstation_override_settings.ini})</li>
-     *   <li>{@code /storage/emulated/0/Android/data/com.github.stenzek.duckstation/files/settings.ini}
-     *       -- DuckStation's default scoped storage location</li>
-     *   <li>{@code /storage/emulated/0/duckstation/settings.ini}
-     *       -- legacy/alternative storage location</li>
-     * </ol>
+     * <p>This method intentionally delegates to RetroDock's main path resolver instead of
+     * hardcoding a search order. That keeps DuckStation hot-apply aligned with the swap engine's
+     * override-aware, cache-aware root selection so both features operate on the same file.</p>
      *
      * @param ctx application context for accessing SharedPreferences
      * @return absolute path to settings.ini if found, or {@code null} if not found
      */
     private static String findDuckStationSettings(Context ctx) {
-        String[] paths = {
-                "/storage/emulated/0/Android/data/com.github.stenzek.duckstation/files/settings.ini",
-                "/storage/emulated/0/duckstation/settings.ini"
-        };
-
-        // Check user override first
-        SharedPreferences prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        String override = prefs.getString("emu_duckstation_override_settings.ini", "");
-        if (!override.isEmpty() && new File(override).exists()) return override;
-
-        for (String p : paths) {
-            if (new File(p).exists()) return p;
-        }
-        return null;
+        return findManagedSettingsPath(ctx, "duckstation", "settings.ini");
     }
 
     /**
@@ -615,15 +731,36 @@ public class EmulatorHotApply {
             String aspectKey = docked ? "scummvm_aspect_docked" : "scummvm_aspect_handheld";
             boolean aspect = prefs.getBoolean(aspectKey, true);
 
-            // Update the [scummvm] section in scummvm.ini with the new graphics settings.
-            // Both gfx_mode and scaler are set for compatibility with different ScummVM versions.
+            if (!prepareTrackedHotApply(ctx, "scummvm", "ScummVM")) {
+                return;
+            }
+
+            // Audit Fix #13: Update all ScummVM graphics keys in one atomic rewrite.
+            //
+            // CONCERN: The previous code issued up to four separate full-file rewrites
+            // (gfx_mode, scaler, filtering, aspect_ratio). If rewrite #3 failed, the file was
+            // still syntactically valid but only half updated for the new dock state.
+            //
+            // FIX: Build one key map and apply it with modifyIniKeys(), so the ScummVM config
+            // transitions as a single logical unit.
+            Map<String, String> updates = new LinkedHashMap<>();
             if (!scaler.isEmpty()) {
-                modifyIniKey(settingsPath, "scummvm", "gfx_mode", scaler);
-                modifyIniKey(settingsPath, "scummvm", "scaler", scaler);
+                // Both gfx_mode and scaler are set for compatibility with different ScummVM versions.
+                updates.put("gfx_mode", scaler);
+                updates.put("scaler", scaler);
+            }
+            updates.put("filtering", filtering ? "true" : "false");
+            updates.put("aspect_ratio", aspect ? "true" : "false");
+
+            if (!modifyIniKeys(settingsPath, "scummvm", updates)) {
+                finishTrackedHotApply(ctx, "scummvm", false, "ScummVM");
+                Log.w(TAG, "ScummVM hot-apply: failed to update scummvm.ini safely");
+                return;
+            }
+            finishTrackedHotApply(ctx, "scummvm", true, "ScummVM");
+            if (!scaler.isEmpty()) {
                 Log.i(TAG, "ScummVM hot-apply: set scaler to " + scaler);
             }
-            modifyIniKey(settingsPath, "scummvm", "filtering", filtering ? "true" : "false");
-            modifyIniKey(settingsPath, "scummvm", "aspect_ratio", aspect ? "true" : "false");
 
             // Issue #9 fix: Attempt to trigger ScummVM's scaler cycle hotkey: Ctrl+Alt+S
             // Android keycodes: KEYCODE_CTRL_LEFT=113, KEYCODE_ALT_LEFT=57, KEYCODE_S=47
@@ -644,33 +781,14 @@ public class EmulatorHotApply {
     /**
      * Locates ScummVM's {@code scummvm.ini} configuration file on the filesystem.
      *
-     * <p>Checks the following locations in order:</p>
-     * <ol>
-     *   <li>User-configured override path from SharedPreferences
-     *       (key: {@code emu_scummvm_override_scummvm.ini})</li>
-     *   <li>{@code /storage/emulated/0/ScummVM/scummvm.ini}
-     *       -- ScummVM's common shared storage location</li>
-     *   <li>{@code /storage/emulated/0/Android/data/org.scummvm.scummvm/files/scummvm.ini}
-     *       -- ScummVM's scoped storage location</li>
-     * </ol>
+     * <p>Uses the same managed resolver as the swap engine so a per-entry override or previously
+     * chosen root applies equally to hot-apply and full profile swaps.</p>
      *
      * @param ctx application context for accessing SharedPreferences
      * @return absolute path to scummvm.ini if found, or {@code null} if not found
      */
     private static String findScummVMSettings(Context ctx) {
-        String[] paths = {
-                "/storage/emulated/0/ScummVM/scummvm.ini",
-                "/storage/emulated/0/Android/data/org.scummvm.scummvm/files/scummvm.ini"
-        };
-
-        SharedPreferences prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        String override = prefs.getString("emu_scummvm_override_scummvm.ini", "");
-        if (!override.isEmpty() && new File(override).exists()) return override;
-
-        for (String p : paths) {
-            if (new File(p).exists()) return p;
-        }
-        return null;
+        return findManagedSettingsPath(ctx, "scummvm", "scummvm.ini");
     }
 
     // =====================================================================
@@ -735,12 +853,27 @@ public class EmulatorHotApply {
             String shaderKey = docked ? "ppsspp_shader_docked" : "ppsspp_shader_handheld";
             String shader = prefs.getString(shaderKey, "");
 
+            if (!prepareTrackedHotApply(ctx, "ppsspp", "PPSSPP")) {
+                return;
+            }
+
+            boolean modified;
             if (!shader.isEmpty()) {
-                modifyIniKey(settingsPath, "Graphics", "PostProcessingShader", shader);
-                Log.i(TAG, "PPSSPP hot-apply: set PostProcessingShader to " + shader);
+                modified = modifyIniKey(settingsPath, "Graphics", "PostProcessingShader", shader);
+                if (modified) {
+                    Log.i(TAG, "PPSSPP hot-apply: set PostProcessingShader to " + shader);
+                }
             } else {
-                modifyIniKey(settingsPath, "Graphics", "PostProcessingShader", "Off");
-                Log.i(TAG, "PPSSPP hot-apply: disabled PostProcessingShader");
+                modified = modifyIniKey(settingsPath, "Graphics", "PostProcessingShader", "Off");
+                if (modified) {
+                    Log.i(TAG, "PPSSPP hot-apply: disabled PostProcessingShader");
+                }
+            }
+
+            if (modified) {
+                finishTrackedHotApply(ctx, "ppsspp", true, "PPSSPP");
+            } else {
+                finishTrackedHotApply(ctx, "ppsspp", false, "PPSSPP");
             }
             // No reliable way to force PPSSPP to reload mid-game.
             // Change takes effect on next game load or restart.
@@ -750,36 +883,15 @@ public class EmulatorHotApply {
     /**
      * Locates PPSSPP's {@code ppsspp.ini} configuration file on the filesystem.
      *
-     * <p>Checks the following locations in order:</p>
-     * <ol>
-     *   <li>User-configured override path from SharedPreferences
-     *       (key: {@code emu_ppsspp_override_SYSTEM_ppsspp.ini})</li>
-     *   <li>{@code /storage/emulated/0/PSP/SYSTEM/ppsspp.ini}
-     *       -- PPSSPP's default shared storage location</li>
-     *   <li>{@code /storage/emulated/0/Android/data/org.ppsspp.ppsspp/files/SYSTEM/ppsspp.ini}
-     *       -- PPSSPP free version scoped storage</li>
-     *   <li>{@code /storage/emulated/0/Android/data/org.ppsspp.ppssppgold/files/SYSTEM/ppsspp.ini}
-     *       -- PPSSPP Gold scoped storage</li>
-     * </ol>
+     * <p>Uses the same override-aware resolver as the swap engine rather than a private path
+     * guesser. That prevents hot-apply from editing a stale legacy config while the real swap
+     * engine manages a different active root.</p>
      *
      * @param ctx application context for accessing SharedPreferences
      * @return absolute path to ppsspp.ini if found, or {@code null} if not found
      */
     private static String findPPSSPPSettings(Context ctx) {
-        String[] paths = {
-                "/storage/emulated/0/PSP/SYSTEM/ppsspp.ini",
-                "/storage/emulated/0/Android/data/org.ppsspp.ppsspp/files/SYSTEM/ppsspp.ini",
-                "/storage/emulated/0/Android/data/org.ppsspp.ppssppgold/files/SYSTEM/ppsspp.ini"
-        };
-
-        SharedPreferences prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        String override = prefs.getString("emu_ppsspp_override_SYSTEM_ppsspp.ini", "");
-        if (!override.isEmpty() && new File(override).exists()) return override;
-
-        for (String p : paths) {
-            if (new File(p).exists()) return p;
-        }
-        return null;
+        return findManagedSettingsPath(ctx, "ppsspp", "SYSTEM/ppsspp.ini");
     }
 
     // =====================================================================
@@ -869,6 +981,45 @@ public class EmulatorHotApply {
     }
 
     /**
+     * Optimistic-concurrency wrapper around all text-config rewrites.
+     *
+     * <p>The dangerous race in hot-apply is not "RetroDock has two threads" -- the
+     * {@link #INI_LOCK} already handles that. The real problem is RetroDock versus the running
+     * emulator. This helper reads a snapshot of the live file, lets the caller transform the
+     * parsed lines, writes the replacement to a temp file, and then verifies the original file is
+     * still byte-for-byte identical to the snapshot before replacing it. If the emulator changed
+     * the file in the meantime, the replace is aborted and retried from the new version.</p>
+     *
+     * <p>This does not create a perfect inter-process lock -- a tiny race window still exists
+     * between the final comparison and the atomic move -- but it eliminates the overwhelmingly
+     * common "read stale snapshot, blindly overwrite newer config" failure mode.</p>
+     */
+    private static boolean rewriteTextConfig(File file, String logLabel, ConfigTransformer transformer) {
+        synchronized (INI_LOCK) {
+            for (int attempt = 1; attempt <= HOT_APPLY_MAX_RETRIES; attempt++) {
+                try {
+                    ConfigFileSnapshot snapshot = readConfigSnapshot(file);
+                    List<String> output = transformer.transform(snapshot.lines);
+                    writeLinesAtomically(file, output, snapshot);
+                    return true;
+                } catch (StaleConfigSnapshotException stale) {
+                    if (attempt == HOT_APPLY_MAX_RETRIES) {
+                        Log.w(TAG, logLabel + " aborted because the emulator kept rewriting the "
+                                + "config file underneath RetroDock: " + stale.getMessage());
+                        return false;
+                    }
+                    Log.w(TAG, logLabel + " detected concurrent emulator write; retrying ("
+                            + attempt + "/" + HOT_APPLY_MAX_RETRIES + "): " + stale.getMessage());
+                } catch (Exception e) {
+                    Log.e(TAG, logLabel + " failed: " + e.getMessage());
+                    return false;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
      * Replaces an entire INI section with new entries, preserving all other sections.
      *
      * <p>This method performs a full rewrite of the target section in an INI-format configuration
@@ -904,113 +1055,171 @@ public class EmulatorHotApply {
      *         does not exist or an I/O error occurred
      */
     static boolean modifyIniSection(String filePath, String section, List<String> newEntries) {
-        // Issue #8: Synchronize on INI_LOCK to prevent concurrent read-modify-write cycles.
-        // Multiple hot-apply threads could target the same INI file (e.g., if two dock events
-        // fire in rapid succession), and without locking, one thread's read could see stale
-        // data that the other thread is about to overwrite.
-        synchronized (INI_LOCK) {
-            try {
-                File file = new File(filePath);
-                if (!file.exists()) return false;
+        File file = new File(filePath);
+        if (!file.exists()) return false;
 
-                List<String> lines = new ArrayList<>();
-                try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        lines.add(line);
+        return rewriteTextConfig(file, "Failed to modify INI section [" + section + "] in " + filePath,
+                lines -> {
+                    List<String> output = new ArrayList<>();
+                    boolean inSection = false;
+                    boolean sectionFound = false;
+                    String sectionHeader = "[" + section + "]";
+
+                    // Issue #10: Collect trailing blank lines within the section so they can be
+                    // preserved before the next section header. Without this, each edit would strip
+                    // the blank line separators that many INI files use between sections.
+                    List<String> trailingBlanks = new ArrayList<>();
+
+                    for (String l : lines) {
+                        String trimmed = l.trim();
+                        if (trimmed.equalsIgnoreCase(sectionHeader)) {
+                            // Audit Fix #8: Handle duplicate sections in malformed INI files.
+                            //
+                            // CONCERN: If a section appears twice (e.g., two [PostProcessing]
+                            // headers), the old code would add newEntries under BOTH headers,
+                            // duplicating the settings. On subsequent edits, each pass would
+                            // double the entries again, causing the file to grow unboundedly.
+                            //
+                            // FIX: Only add entries under the FIRST occurrence of the section.
+                            // Subsequent duplicate section headers are still detected (inSection
+                            // is set to true so their old content is stripped), but newEntries
+                            // are NOT added again. This effectively merges duplicates into one.
+                            inSection = true;
+                            trailingBlanks.clear();
+                            if (!sectionFound) {
+                                // First occurrence: write header and new entries
+                                sectionFound = true;
+                                output.add(l);
+                                output.addAll(newEntries);
+                            } else {
+                                // Duplicate occurrence: strip header and contents (skip output.add)
+                                Log.w(TAG, "Duplicate section [" + section + "] found in " + filePath
+                                        + " — stripping duplicate to prevent entry duplication");
+                            }
+                            continue;
+                        }
+                        if (inSection) {
+                            if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+                                // We are leaving the target section and entering a new one.
+                                // Issue #10: Re-insert any trailing blank lines that appeared before
+                                // this next section header to preserve visual separation between sections.
+                                output.addAll(trailingBlanks);
+                                trailingBlanks.clear();
+                                inSection = false;
+                                output.add(l);
+                            } else if (trimmed.isEmpty()) {
+                                // Issue #10: Buffer blank lines -- they might be separators before the
+                                // next section. If more non-blank content follows within this section,
+                                // these blanks are discarded (they were part of the old content being
+                                // replaced). If a section header follows, they are preserved.
+                                trailingBlanks.add(l);
+                            } else {
+                                // Non-blank content within the section being replaced -- discard it,
+                                // and discard any blank lines that preceded it (they were interspersed
+                                // in the old section content, not separators before the next section).
+                                trailingBlanks.clear();
+                            }
+                            continue;
+                        }
+                        output.add(l);
                     }
-                }
 
-                List<String> output = new ArrayList<>();
-                boolean inSection = false;
-                boolean sectionFound = false;
-                String sectionHeader = "[" + section + "]";
+                    // If the section didn't exist in the file, append it at the end
+                    if (!sectionFound) {
+                        output.add("");
+                        output.add(sectionHeader);
+                        output.addAll(newEntries);
+                    }
+                    return output;
+                });
+    }
 
-                // Issue #10: Collect trailing blank lines within the section so they can be
-                // preserved before the next section header. Without this, each edit would strip
-                // the blank line separators that many INI files use between sections.
-                List<String> trailingBlanks = new ArrayList<>();
+    /**
+     * Atomically updates one or more key-value pairs inside a single INI section.
+     *
+     * <p>This is the multi-key companion to {@link #modifyIniKey}. It exists because some
+     * emulators, especially ScummVM, need several keys changed together to represent one logical
+     * graphics mode transition. Writing those keys one by one left the file valid but only
+     * partially updated if the third or fourth write failed. By applying the entire key set in
+     * one optimistic-concurrency rewrite, the config is either updated completely or not at all.</p>
+     */
+    static boolean modifyIniKeys(String filePath, String section, Map<String, String> updates) {
+        File file = new File(filePath);
+        if (!file.exists()) return false;
+        if (updates == null || updates.isEmpty()) return true;
 
-                for (String l : lines) {
-                    String trimmed = l.trim();
-                    if (trimmed.equalsIgnoreCase(sectionHeader)) {
-                        // Audit Fix #8: Handle duplicate sections in malformed INI files.
-                        //
-                        // CONCERN: If a section appears twice (e.g., two [PostProcessing]
-                        // headers), the old code would add newEntries under BOTH headers,
-                        // duplicating the settings. On subsequent edits, each pass would
-                        // double the entries again, causing the file to grow unboundedly.
-                        //
-                        // FIX: Only add entries under the FIRST occurrence of the section.
-                        // Subsequent duplicate section headers are still detected (inSection
-                        // is set to true so their old content is stripped), but newEntries
-                        // are NOT added again. This effectively merges duplicates into one.
-                        inSection = true;
-                        trailingBlanks.clear();
-                        if (!sectionFound) {
-                            // First occurrence: write header and new entries
+        return rewriteTextConfig(file, "Failed to modify INI keys in [" + section + "] of " + filePath,
+                lines -> {
+                    List<String> output = new ArrayList<>();
+                    boolean inSection = false;
+                    boolean sectionFound = false;
+                    String sectionHeader = "[" + section + "]";
+
+                    // Track which keys we have already written so duplicate stale copies in the
+                    // original file can be stripped instead of surviving beside the new values.
+                    Map<String, Boolean> writtenKeys = new LinkedHashMap<>();
+                    for (String key : updates.keySet()) {
+                        writtenKeys.put(key, false);
+                    }
+
+                    for (String l : lines) {
+                        String trimmed = l.trim();
+                        if (trimmed.equalsIgnoreCase(sectionHeader)) {
+                            inSection = true;
                             sectionFound = true;
                             output.add(l);
-                            for (String entry : newEntries) {
-                                output.add(entry);
-                            }
-                        } else {
-                            // Duplicate occurrence: strip header and contents (skip output.add)
-                            Log.w(TAG, "Duplicate section [" + section + "] found in " + filePath
-                                    + " — stripping duplicate to prevent entry duplication");
+                            continue;
                         }
-                        continue;
+                        if (inSection) {
+                            if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+                                for (Map.Entry<String, String> update : updates.entrySet()) {
+                                    if (!writtenKeys.get(update.getKey())) {
+                                        output.add(update.getKey() + " = " + update.getValue());
+                                        writtenKeys.put(update.getKey(), true);
+                                    }
+                                }
+                                inSection = false;
+                                output.add(l);
+                                continue;
+                            }
+
+                            if (trimmed.contains("=")) {
+                                int eqIndex = trimmed.indexOf('=');
+                                String lineKey = trimmed.substring(0, eqIndex).trim();
+                                if (updates.containsKey(lineKey)) {
+                                    // Audit Fix #12: Collapse duplicate key definitions down to the
+                                    // one authoritative value from 'updates'. The first match emits
+                                    // the replacement; later duplicates are stripped.
+                                    if (!writtenKeys.get(lineKey)) {
+                                        output.add(lineKey + " = " + updates.get(lineKey));
+                                        writtenKeys.put(lineKey, true);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        output.add(l);
                     }
+
                     if (inSection) {
-                        if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-                            // We are leaving the target section and entering a new one.
-                            // Issue #10: Re-insert any trailing blank lines that appeared before
-                            // this next section header to preserve visual separation between sections.
-                            for (String blank : trailingBlanks) {
-                                output.add(blank);
+                        for (Map.Entry<String, String> update : updates.entrySet()) {
+                            if (!writtenKeys.get(update.getKey())) {
+                                output.add(update.getKey() + " = " + update.getValue());
+                                writtenKeys.put(update.getKey(), true);
                             }
-                            trailingBlanks.clear();
-                            inSection = false;
-                            output.add(l);
-                        } else if (trimmed.isEmpty()) {
-                            // Issue #10: Buffer blank lines -- they might be separators before the
-                            // next section. If more non-blank content follows within this section,
-                            // these blanks are discarded (they were part of the old content being
-                            // replaced). If a section header follows, they are preserved.
-                            trailingBlanks.add(l);
-                        } else {
-                            // Non-blank content within the section being replaced -- discard it,
-                            // and discard any blank lines that preceded it (they were interspersed
-                            // in the old section content, not separators before the next section).
-                            trailingBlanks.clear();
                         }
-                        continue;
                     }
-                    output.add(l);
-                }
 
-                // If the section didn't exist in the file, append it at the end
-                if (!sectionFound) {
-                    output.add("");
-                    output.add(sectionHeader);
-                    for (String entry : newEntries) {
-                        output.add(entry);
+                    if (!sectionFound) {
+                        output.add("");
+                        output.add(sectionHeader);
+                        for (Map.Entry<String, String> update : updates.entrySet()) {
+                            output.add(update.getKey() + " = " + update.getValue());
+                        }
                     }
-                }
 
-                // Write to a temp file in the same directory and replace the original only after
-                // the full new contents are durable on disk. The previous implementation opened
-                // the real INI directly with FileWriter, which truncates the file up front. If
-                // RetroDock or the emulator died mid-write, the user could be left with a partial
-                // or empty config. Temp-file replacement keeps the original untouched until the
-                // new version is complete.
-                writeLinesAtomically(file, output);
-                return true;
-            } catch (Exception e) {
-                Log.e(TAG, "Failed to modify INI section [" + section + "] in " + filePath + ": " + e.getMessage());
-                return false;
-            }
-        }
+                    return output;
+                });
     }
 
     /**
@@ -1056,91 +1265,9 @@ public class EmulatorHotApply {
      *         does not exist or an I/O error occurred
      */
     static boolean modifyIniKey(String filePath, String section, String key, String value) {
-        // Issue #8: Synchronize on INI_LOCK to prevent concurrent read-modify-write cycles.
-        // This is especially important for ScummVM hot-apply, which calls modifyIniKey multiple
-        // times in sequence (gfx_mode, scaler, filtering, aspect_ratio) -- without locking,
-        // another thread could interleave and corrupt the file.
-        synchronized (INI_LOCK) {
-            try {
-                File file = new File(filePath);
-                if (!file.exists()) return false;
-
-                List<String> lines = new ArrayList<>();
-                try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        lines.add(line);
-                    }
-                }
-
-                List<String> output = new ArrayList<>();
-                boolean inSection = false;
-                boolean keyFound = false;
-                boolean sectionFound = false;
-                String sectionHeader = "[" + section + "]";
-
-                for (String l : lines) {
-                    String trimmed = l.trim();
-                    if (trimmed.equalsIgnoreCase(sectionHeader)) {
-                        inSection = true;
-                        sectionFound = true;
-                        output.add(l);
-                        continue;
-                    }
-                    if (inSection) {
-                        if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-                            // We are leaving the target section and entering a new one.
-                            // If the key was never found, insert it before the new section header.
-                            if (!keyFound) {
-                                output.add(key + " = " + value);
-                                keyFound = true;
-                            }
-                            inSection = false;
-                            output.add(l);
-                            continue;
-                        }
-                        // Issue #12 fix: Robust key matching by splitting on the first '=' and
-                        // comparing the trimmed left-hand side. The old approach used startsWith(),
-                        // which could false-match keys sharing a prefix (e.g., "Stage" matching
-                        // "StageCount"). Splitting on '=' and trimming ensures we match the exact
-                        // key name regardless of whitespace around the '=' sign.
-                        if (!keyFound && trimmed.contains("=")) {
-                            int eqIndex = trimmed.indexOf('=');
-                            String lineKey = trimmed.substring(0, eqIndex).trim();
-                            if (lineKey.equals(key)) {
-                                // Replace the existing key-value pair
-                                output.add(key + " = " + value);
-                                keyFound = true;
-                                continue;
-                            }
-                        }
-                    }
-                    output.add(l);
-                }
-
-                // If we reached EOF while still in the target section and the key wasn't found,
-                // append the key-value pair at the end of the file (still within the section)
-                if (inSection && !keyFound) {
-                    output.add(key + " = " + value);
-                    keyFound = true;
-                }
-
-                // If the section was never found at all, append the entire section with the key
-                if (!sectionFound) {
-                    output.add("");
-                    output.add(sectionHeader);
-                    output.add(key + " = " + value);
-                }
-
-                // Same safety guarantee as modifyIniSection(): never truncate the live config
-                // until the replacement bytes already exist in a temp file beside it.
-                writeLinesAtomically(file, output);
-                return true;
-            } catch (Exception e) {
-                Log.e(TAG, "Failed to modify INI key " + key + " in [" + section + "] of " + filePath + ": " + e.getMessage());
-                return false;
-            }
-        }
+        Map<String, String> singleUpdate = new LinkedHashMap<>();
+        singleUpdate.put(key, value);
+        return modifyIniKeys(filePath, section, singleUpdate);
     }
 
     /**
@@ -1198,11 +1325,18 @@ public class EmulatorHotApply {
      *       failed but no data is lost.</li>
      * </ul>
      *
-     * @param file   the original INI file to replace
-     * @param output the complete list of lines that should constitute the new file contents
+     * <h3>Stale-snapshot protection</h3>
+     * <p>Before replacing the original, we compare its current raw-byte hash against the
+     * {@code expectedOriginal} snapshot that the caller read. If the emulator saved a newer
+     * version in the meantime, we abort instead of clobbering it with RetroDock's stale view.</p>
+     *
+     * @param file             the original INI/config file to replace
+     * @param output           the complete list of lines that should constitute the new file contents
+     * @param expectedOriginal snapshot of the original file that was used to compute {@code output}
      * @throws IOException if the temp file cannot be written or the replacement fails
      */
-    private static void writeLinesAtomically(File file, List<String> output) throws IOException {
+    private static void writeLinesAtomically(File file, List<String> output,
+                                             ConfigFileSnapshot expectedOriginal) throws IOException {
         // Step 1: Create a uniquely-named temp file next to the original.
         // The nanoTime() suffix prevents collisions if two hot-apply operations target
         // the same INI file in rapid succession (shouldn't happen due to INI_LOCK, but
@@ -1249,6 +1383,20 @@ public class EmulatorHotApply {
 
         // Step 3: Replace the original file with the fully-written temp file.
         try {
+            // Audit Fix #14: Refuse to overwrite a config file that changed since we read it.
+            //
+            // CONCERN: Temp-file replacement solves truncation, but by itself it does not solve
+            // stale snapshots. The emulator could have written a newer config version after
+            // RetroDock read the file but before RetroDock moved the temp into place.
+            //
+            // FIX: Compare the live file against the snapshot used to derive 'output'. If the
+            // hashes differ, the caller must re-read and retry from the latest on-disk content.
+            if (!matchesSnapshot(file, expectedOriginal)) {
+                temp.delete();
+                throw new StaleConfigSnapshotException("live file changed after read (path="
+                        + file.getAbsolutePath() + ", expectedSize=" + expectedOriginal.size
+                        + ", currentSize=" + file.length() + ")");
+            }
             try {
                 // First attempt: atomic move. On supported filesystems, this is a single
                 // rename(2) syscall — the original file is replaced instantaneously with no
@@ -1299,9 +1447,88 @@ public class EmulatorHotApply {
         }
     }
 
+    private static ConfigFileSnapshot readConfigSnapshot(File file) throws IOException {
+        byte[] bytes = Files.readAllBytes(file.toPath());
+        List<String> lines = new ArrayList<>();
+        try (BufferedReader reader = new BufferedReader(
+                new StringReader(new String(bytes, Charset.defaultCharset())))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                lines.add(line);
+            }
+        }
+        return new ConfigFileSnapshot(lines, sha256(bytes), bytes.length, file.lastModified());
+    }
+
+    private static boolean matchesSnapshot(File file, ConfigFileSnapshot snapshot) throws IOException {
+        if (!file.exists()) {
+            return false;
+        }
+        byte[] currentBytes = Files.readAllBytes(file.toPath());
+        if (currentBytes.length != snapshot.size) {
+            return false;
+        }
+        return MessageDigest.isEqual(snapshot.sha256, sha256(currentBytes));
+    }
+
+    private static byte[] sha256(byte[] bytes) throws IOException {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return digest.digest(bytes);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IOException("SHA-256 unavailable", e);
+        }
+    }
+
     // =====================================================================
     // Flat Config File Editing (no sections, e.g. retroarch.cfg)
     // =====================================================================
+
+    /**
+     * Atomically updates one or more key-value pairs in a flat (sectionless) config file.
+     *
+     * <p>This exists for cases like RetroArch bootstrap settings where two related keys must be
+     * kept in sync. Writing them together avoids half-updated flat configs in the same way
+     * {@link #modifyIniKeys} avoids half-updated section-based INI files.</p>
+     */
+    static boolean modifyFlatKeys(String filePath, Map<String, String> updates) {
+        File file = new File(filePath);
+        if (!file.exists()) return false;
+        if (updates == null || updates.isEmpty()) return true;
+
+        return rewriteTextConfig(file, "Failed to modify flat config keys in " + filePath,
+                lines -> {
+                    List<String> output = new ArrayList<>();
+                    Map<String, Boolean> writtenKeys = new LinkedHashMap<>();
+                    for (String key : updates.keySet()) {
+                        writtenKeys.put(key, false);
+                    }
+
+                    for (String l : lines) {
+                        String trimmed = l.trim();
+                        if (trimmed.contains("=")) {
+                            int eqIndex = trimmed.indexOf('=');
+                            String lineKey = trimmed.substring(0, eqIndex).trim();
+                            if (updates.containsKey(lineKey)) {
+                                if (!writtenKeys.get(lineKey)) {
+                                    output.add(lineKey + " = \"" + updates.get(lineKey) + "\"");
+                                    writtenKeys.put(lineKey, true);
+                                }
+                                continue;
+                            }
+                        }
+                        output.add(l);
+                    }
+
+                    for (Map.Entry<String, String> update : updates.entrySet()) {
+                        if (!writtenKeys.get(update.getKey())) {
+                            output.add(update.getKey() + " = \"" + update.getValue() + "\"");
+                            writtenKeys.put(update.getKey(), true);
+                        }
+                    }
+                    return output;
+                });
+    }
 
     /**
      * Modifies a single key-value pair in a flat (sectionless) config file.
@@ -1331,49 +1558,9 @@ public class EmulatorHotApply {
      * @return {@code true} if the file was successfully modified
      */
     static boolean modifyFlatKey(String filePath, String key, String value) {
-        synchronized (INI_LOCK) {
-            try {
-                File file = new File(filePath);
-                if (!file.exists()) return false;
-
-                List<String> lines = new ArrayList<>();
-                try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        lines.add(line);
-                    }
-                }
-
-                List<String> output = new ArrayList<>();
-                boolean keyFound = false;
-
-                for (String l : lines) {
-                    String trimmed = l.trim();
-                    if (!keyFound && trimmed.contains("=")) {
-                        int eqIndex = trimmed.indexOf('=');
-                        String lineKey = trimmed.substring(0, eqIndex).trim();
-                        if (lineKey.equals(key)) {
-                            // Replace the existing key-value pair
-                            output.add(key + " = \"" + value + "\"");
-                            keyFound = true;
-                            continue;
-                        }
-                    }
-                    output.add(l);
-                }
-
-                // If the key wasn't found anywhere, append it at the end
-                if (!keyFound) {
-                    output.add(key + " = \"" + value + "\"");
-                }
-
-                writeLinesAtomically(file, output);
-                return true;
-            } catch (Exception e) {
-                Log.e(TAG, "Failed to modify flat key " + key + " in " + filePath + ": " + e.getMessage());
-                return false;
-            }
-        }
+        Map<String, String> singleUpdate = new LinkedHashMap<>();
+        singleUpdate.put(key, value);
+        return modifyFlatKeys(filePath, singleUpdate);
     }
 
     /**
@@ -1395,22 +1582,28 @@ public class EmulatorHotApply {
      *       sets {@code network_cmd_enable = "false"} (leaves port unchanged)</li>
      * </ul>
      *
+     * @param ctx    application context used to resolve the exact managed retroarch.cfg path
      * @param enable {@code true} to enable network commands, {@code false} to disable
      * @return {@code true} if the config file was successfully modified
      */
-    public static boolean setRetroArchNetworkCommands(boolean enable) {
-        // Find the active retroarch.cfg across known root directories
-        String cfgPath = ProfileSwitcher.findSettingsFile(RETROARCH_ROOTS, "retroarch.cfg");
+    public static boolean setRetroArchNetworkCommands(Context ctx, boolean enable) {
+        // Resolve retroarch.cfg through the same override-aware path resolver used by the swap
+        // engine. This keeps the persistent hot-apply bootstrap edit aligned with the file
+        // RetroDock will later swap and recover.
+        String cfgPath = findManagedSettingsPath(ctx, "retroarch", "retroarch.cfg");
         if (cfgPath == null) {
             Log.w(TAG, "retroarch.cfg not found, cannot set network_cmd_enable");
             return false;
         }
 
-        boolean ok = modifyFlatKey(cfgPath, "network_cmd_enable", enable ? "true" : "false");
-        if (ok && enable) {
-            // Also ensure the port is set to the expected value
-            modifyFlatKey(cfgPath, "network_cmd_port", "55355");
+        Map<String, String> updates = new LinkedHashMap<>();
+        updates.put("network_cmd_enable", enable ? "true" : "false");
+        if (enable) {
+            // Also ensure the port is set to the expected value. Both keys are written in one
+            // atomic rewrite so RetroArch never sees a half-updated command configuration.
+            updates.put("network_cmd_port", "55355");
         }
+        boolean ok = modifyFlatKeys(cfgPath, updates);
         Log.i(TAG, "RetroArch network_cmd_enable set to " + enable + " in " + cfgPath);
         return ok;
     }
