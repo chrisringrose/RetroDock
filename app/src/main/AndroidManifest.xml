@@ -6,8 +6,61 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
-    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+         Package visibility fix:
+
+         RetroDock does not enumerate arbitrary installed apps. EmulatorConfig.getInstalled()
+         probes a fixed, built-in list of known emulator package names with PackageManager.
+         Using QUERY_ALL_PACKAGES for that narrow use case is broader than necessary and creates
+         extra review / policy surface.
+
+         The targeted <queries> block below keeps installation detection working for the exact
+         package names RetroDock knows about while avoiding global package visibility.
+    -->
+    <queries>
+        <package android:name="com.retroarch" />
+        <package android:name="com.retroarch.aarch64" />
+        <package android:name="com.retroarch.ra32" />
+        <package android:name="com.swordfish.lemuroid" />
+        <package android:name="org.dolphinemu.dolphinemu" />
+        <package android:name="org.dolphinemu.handheld" />
+        <package android:name="org.citra.citra_emu" />
+        <package android:name="org.citra.citra_emu.canary" />
+        <package android:name="io.github.lime3ds.android" />
+        <package android:name="io.github.lime3ds.android.canary" />
+        <package android:name="org.PabloMK7.citra" />
+        <package android:name="org.yuzu.yuzu_emu" />
+        <package android:name="org.yuzu.yuzu_emu.ea" />
+        <package android:name="org.ryujinx.Ryujinx" />
+        <package android:name="dev.suyu.suyu_emu" />
+        <package android:name="org.citron.citron_emu" />
+        <package android:name="it.dbtecno.pizzaboygba" />
+        <package android:name="it.dbtecno.pizzaboygbapro" />
+        <package android:name="it.dbtecno.pizzaboygbc" />
+        <package android:name="it.dbtecno.pizzaboygbcpro" />
+        <package android:name="org.mupen64plusae.v3.fzurita" />
+        <package android:name="org.mupen64plusae.v3.fzurita.pro" />
+        <package android:name="com.dsemu.drastic" />
+        <package android:name="me.magnum.melonds" />
+        <package android:name="com.explusalpha.Snes9xPlus" />
+        <package android:name="io.mgba.mgba" />
+        <package android:name="com.github.stenzek.duckstation" />
+        <package android:name="xyz.aethersx2.android" />
+        <package android:name="org.ppsspp.ppsspp" />
+        <package android:name="org.ppsspp.ppssppgold" />
+        <package android:name="org.vita3k.emulator" />
+        <package android:name="io.recompiled.redream" />
+        <package android:name="com.flycast.emulator" />
+        <package android:name="org.uoyabause.urern" />
+        <package android:name="org.devmiyax.yabasanshioro2.pro" />
+        <package android:name="org.scummvm.scummvm" />
+        <package android:name="bruenor.magicbox" />
+        <package android:name="bruenor.magicbox.free" />
+        <package android:name="com.seleuco.mame4droid2024" />
+        <package android:name="com.seleuco.mame4droid" />
+    </queries>
 
     <application
         android:label="RetroDock"
@@ -43,6 +96,7 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 

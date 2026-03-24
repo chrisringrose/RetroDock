@@ -552,105 +552,35 @@ public class EmulatorHotApply {
      * @param ctx    application context, used to access SharedPreferences and check running packages
      * @param docked {@code true} if the device was just docked, {@code false} if just undocked
      */
+    /**
+     * DuckStation hot-apply — intentionally a no-op on Android.
+     *
+     * <h3>Why this does nothing</h3>
+     * <p>DuckStation on Android stores its main settings (including post-processing shaders)
+     * in Android's {@code SharedPreferences} — an internal key-value store at
+     * {@code /data/data/com.github.stenzek.duckstation/shared_prefs/} that is sandboxed
+     * by Android and inaccessible without root access. The desktop version uses a
+     * {@code settings.ini} file, but the Android version never has.</p>
+     *
+     * <p>This was confirmed by examining the old open-source Android code (removed from
+     * GitHub in June 2021), which used {@code AndroidSettingsInterface} — a JNI wrapper
+     * around {@code SharedPreferences} where the {@code Save()} method was literally a
+     * no-op because SharedPreferences auto-persists.</p>
+     *
+     * <h3>What IS supported</h3>
+     * <p>RetroDock can still swap DuckStation's <b>per-game settings</b> — the
+     * {@code gamesettings/} directory contains real {@code .ini} files (one per game
+     * serial) that live in accessible storage and are swapped by the normal profile
+     * swap engine on dock/undock events when DuckStation is not running.</p>
+     *
+     * @param ctx    unused (kept for interface consistency)
+     * @param docked unused
+     */
     public static void hotApplyDuckStation(Context ctx, boolean docked) {
-        SharedPreferences prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        if (!prefs.getBoolean("duckstation_hot_apply_enabled", false)) return;
-
-        scheduleDelayed(ctx, "duckstation", docked, () -> {
-            String[] pkgs = {"com.github.stenzek.duckstation"};
-            if (!ProfileSwitcher.isAnyPackageRunning(ctx, pkgs)) {
-                Log.i(TAG, "DuckStation no longer running, skipping hot-apply");
-                return;
-            }
-
-            // Locate DuckStation's settings.ini on the filesystem
-            String settingsPath = findDuckStationSettings(ctx);
-            if (settingsPath == null) {
-                Log.w(TAG, "DuckStation settings.ini not found");
-                return;
-            }
-
-            // Get the user's desired shader chain for the current dock state
-            String chainKey = docked ? "duckstation_shaders_docked" : "duckstation_shaders_handheld";
-            String shaderChain = prefs.getString(chainKey, "");
-
-            if (!prepareTrackedHotApply(ctx, "duckstation", "DuckStation")) {
-                return;
-            }
-
-            // Rewrite the entire [PostProcessing] section with the new shader chain
-            boolean modified = modifyIniSection(settingsPath, "PostProcessing", buildDuckStationShaderEntries(shaderChain));
-            if (modified) {
-                finishTrackedHotApply(ctx, "duckstation", true, "DuckStation");
-                Log.i(TAG, "DuckStation hot-apply: updated PostProcessing in settings.ini");
-
-                // Attempt to trigger an immediate reload via Android keyevent.
-                // The user must have configured a "Reload Post-Processing Shaders" hotkey
-                // in DuckStation and provided the matching Android keycode in RetroDock settings.
-                int reloadKeycode = prefs.getInt("duckstation_reload_keycode", 0);
-                if (reloadKeycode > 0) {
-                    sendKeyEvent(reloadKeycode);
-                    Log.i(TAG, "DuckStation hot-apply: sent reload keyevent " + reloadKeycode);
-                } else {
-                    Log.i(TAG, "DuckStation hot-apply: no reload keycode configured, shader will apply on next restart");
-                }
-            } else {
-                finishTrackedHotApply(ctx, "duckstation", false, "DuckStation");
-            }
-        });
-    }
-
-    /**
-     * Locates DuckStation's {@code settings.ini} file on the filesystem.
-     *
-     * <p>This method intentionally delegates to RetroDock's main path resolver instead of
-     * hardcoding a search order. That keeps DuckStation hot-apply aligned with the swap engine's
-     * override-aware, cache-aware root selection so both features operate on the same file.</p>
-     *
-     * @param ctx application context for accessing SharedPreferences
-     * @return absolute path to settings.ini if found, or {@code null} if not found
-     */
-    private static String findDuckStationSettings(Context ctx) {
-        return findManagedSettingsPath(ctx, "duckstation", "settings.ini");
-    }
-
-    /**
-     * Builds the INI key-value entries for DuckStation's {@code [PostProcessing]} section.
-     *
-     * <p>DuckStation's post-processing configuration uses a numbered stage system:</p>
-     * <pre>
-     * [PostProcessing]
-     * Enabled = true
-     * StageCount = 2
-     * Stage1 = CRT-Geom
-     * Stage2 = FXAA
-     * </pre>
-     *
-     * <p>When the shader chain is empty, post-processing is disabled:</p>
-     * <pre>
-     * [PostProcessing]
-     * StageCount = 0
-     * Enabled = false
-     * </pre>
-     *
-     * @param shaderChain comma-separated shader names (e.g. "CRT-Geom,FXAA"), or empty/null
-     *                    to disable post-processing entirely
-     * @return list of INI key-value lines to write under the [PostProcessing] section header
-     */
-    private static List<String> buildDuckStationShaderEntries(String shaderChain) {
-        List<String> entries = new ArrayList<>();
-        if (shaderChain == null || shaderChain.trim().isEmpty()) {
-            entries.add("StageCount = 0");
-            entries.add("Enabled = false");
-        } else {
-            String[] shaders = shaderChain.split(",");
-            entries.add("Enabled = true");
-            entries.add("StageCount = " + shaders.length);
-            for (int i = 0; i < shaders.length; i++) {
-                entries.add("Stage" + (i + 1) + " = " + shaders[i].trim());
-            }
-        }
-        return entries;
+        // No-op: DuckStation Android uses SharedPreferences, not settings.ini.
+        // Per-game settings are handled by the normal file swap in ProfileSwitcher.
+        Log.i(TAG, "DuckStation hot-apply skipped: Android version uses SharedPreferences "
+                + "(only per-game settings in gamesettings/ are swappable)");
     }
 
     // =====================================================================
@@ -923,6 +853,12 @@ public class EmulatorHotApply {
      * {@link #pendingHotApply} so that {@link #cancelPending(String)} can remove it from
      * the Handler's message queue.</p>
      *
+     * <p><b>Follow-up fix -- in-flight worker serialization:</b> queue cancellation alone is not
+     * enough once the delayed runnable has already started its background thread. At that point
+     * the worker is no longer in the Handler queue and cannot be cancelled. To keep those live
+     * workers from racing exit-time restore/swap logic, the worker now runs under RetroDock's
+     * per-emulator lock via {@link ProfileSwitcher#runWithEmulatorLock(String, Runnable)}.</p>
+     *
      * @param ctx    application context (unused in the current implementation but passed for
      *               future extensibility and consistency with other methods)
      * @param emuId  emulator identifier used to track and cancel pending hot-apply operations
@@ -945,7 +881,14 @@ public class EmulatorHotApply {
             synchronized (pendingHotApply) {
                 pendingHotApply.remove(emuId);
             }
-            new Thread(action, "HotApply-" + emuId).start();
+            new Thread(() ->
+                    // Critical integrity fix: once the delayed worker starts, it must
+                    // serialize with exit-time finalization and normal swap logic. Holding the
+                    // per-emulator lock across the ENTIRE hot-apply action means the exit watcher
+                    // cannot restore/swap files in the middle of a live file rewrite, and the
+                    // worker cannot resume after finalization and silently re-dirty the config.
+                    ProfileSwitcher.runWithEmulatorLock(emuId, action),
+                    "HotApply-" + emuId).start();
         };
 
         synchronized (pendingHotApply) {

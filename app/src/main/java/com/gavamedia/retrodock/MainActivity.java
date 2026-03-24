@@ -10,6 +10,7 @@ import android.content.SharedPreferences;
 import android.hardware.display.DisplayManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.util.Log;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.View;
@@ -297,10 +298,26 @@ public class MainActivity extends Activity {
             defaultH = String.valueOf(deviceProfile.dockedHeight);
         }
 
-        if (userSet) {
-            widthInput.setText(prefs.getString("width", defaultW));
-            heightInput.setText(prefs.getString("height", defaultH));
+        String storedWidth = prefs.getString("width", defaultW);
+        String storedHeight = prefs.getString("height", defaultH);
+        if (userSet && isPositiveInteger(storedWidth) && isPositiveInteger(storedHeight)) {
+            widthInput.setText(storedWidth);
+            heightInput.setText(storedHeight);
         } else {
+            if (userSet) {
+                // Old versions could persist blank, non-numeric, or non-positive values. If we
+                // keep loading those forever, the service will fail every dock event until the
+                // user notices and fixes the fields manually. Reset invalid saved values back to
+                // safe defaults so one bad preference does not permanently strand profile swaps.
+                Log.w("RetroDock", "Discarding invalid saved docked resolution: width=\""
+                        + storedWidth + "\", height=\"" + storedHeight + "\"");
+                prefs.edit()
+                        .remove("width")
+                        .remove("height")
+                        .putBoolean("resolution_user_set", false)
+                        .apply();
+                userSet = false;
+            }
             widthInput.setText(defaultW);
             heightInput.setText(defaultH);
         }
@@ -309,6 +326,22 @@ public class MainActivity extends Activity {
         boolean enabled = prefs.getBoolean("service_enabled", false);
         serviceToggle.setChecked(enabled);
         resolutionSection.setVisibility(enabled ? View.VISIBLE : View.GONE);
+
+        // -- Service health check --
+        // If the user previously enabled the service but it's not running (e.g. after
+        // an app update killed the process, or the system killed it without restarting),
+        // restart it automatically. This is a safety net on top of the MY_PACKAGE_REPLACED
+        // broadcast receiver — the receiver handles updates even when the user doesn't open
+        // the app, while this check handles any edge case where the service died silently.
+        if (enabled && !isServiceRunning()) {
+            Log.i("RetroDock", "Service should be running but isn't — restarting");
+            Intent serviceIntent = new Intent(this, DisplayMonitorService.class);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent);
+            } else {
+                startService(serviceIntent);
+            }
+        }
 
         // -- Restore suggested button --
         // Show only when user has customized resolution AND a device profile exists
@@ -319,12 +352,10 @@ public class MainActivity extends Activity {
      * Saves the current resolution values to SharedPreferences and marks them
      * as user-set so they take priority over device defaults.
      */
-    private void saveResolution() {
-        String w = widthInput.getText().toString().trim();
-        String h = heightInput.getText().toString().trim();
+    private void saveResolution(int width, int height) {
         prefs.edit()
-                .putString("width", w)
-                .putString("height", h)
+                .putString("width", String.valueOf(width))
+                .putString("height", String.valueOf(height))
                 .putString("drm_node", getSelectedNode())
                 .putBoolean("resolution_user_set", true)
                 .apply();
@@ -383,8 +414,26 @@ public class MainActivity extends Activity {
             resolutionSection.setVisibility(isChecked ? View.VISIBLE : View.GONE);
 
             if (isChecked) {
+                // Validate before persisting or starting the service.
+                //
+                // Old behavior bug:
+                //   enabling the monitor service blindly saved whatever text happened to be in the
+                //   width/height boxes. A blank or non-numeric value then caused dock handling to
+                //   fail later inside DisplayMonitorService.
+                //
+                // Fix:
+                //   refuse to enable the service until the docked resolution fields contain
+                //   positive integers. This keeps invalid prefs from ever reaching the service.
+                int[] resolution = parseResolutionInputs(true);
+                if (resolution == null) {
+                    prefs.edit().putBoolean("service_enabled", false).apply();
+                    resolutionSection.setVisibility(View.GONE);
+                    buttonView.setChecked(false);
+                    return;
+                }
+
                 // Save current resolution values before starting the service
-                saveResolution();
+                saveResolution(resolution[0], resolution[1]);
                 startMonitorService();
             } else {
                 stopMonitorService();
@@ -398,24 +447,15 @@ public class MainActivity extends Activity {
      */
     private void setupTestResetButtons() {
         testButton.setOnClickListener(v -> {
-            String w = widthInput.getText().toString().trim();
-            String h = heightInput.getText().toString().trim();
-            if (w.isEmpty() || h.isEmpty()) {
-                Toast.makeText(this, "Enter width and height", Toast.LENGTH_SHORT).show();
+            int[] resolution = parseResolutionInputs(true);
+            if (resolution == null) {
                 return;
             }
-            int parsedW, parsedH;
-            try {
-                parsedW = Integer.parseInt(w);
-                parsedH = Integer.parseInt(h);
-            } catch (NumberFormatException e) {
-                Toast.makeText(this, "Width and height must be numbers", Toast.LENGTH_SHORT).show();
-                return;
-            }
-            boolean ok = ResolutionHelper.setResolution(getContentResolver(), parsedW, parsedH);
+            boolean ok = ResolutionHelper.setResolution(getContentResolver(), resolution[0], resolution[1]);
             if (ok) {
-                Toast.makeText(this, "Resolution set to " + w + "x" + h, Toast.LENGTH_SHORT).show();
-                saveResolution();
+                Toast.makeText(this, "Resolution set to " + resolution[0] + "x" + resolution[1],
+                        Toast.LENGTH_SHORT).show();
+                saveResolution(resolution[0], resolution[1]);
             } else {
                 Toast.makeText(this, "Failed to set resolution", Toast.LENGTH_SHORT).show();
             }
@@ -534,9 +574,13 @@ public class MainActivity extends Activity {
 
         // -- Service status --
         boolean enabled = prefs.getBoolean("service_enabled", false);
-        if (enabled) {
+        boolean running = isServiceRunning();
+        if (enabled && running) {
             serviceStatusText.setText("Service: running");
             serviceStatusText.setTextColor(0xFF4CAF50); // green
+        } else if (enabled) {
+            serviceStatusText.setText("Service: enabled but not running");
+            serviceStatusText.setTextColor(0xFFFF9800); // orange
         } else {
             serviceStatusText.setText("Service: stopped");
             serviceStatusText.setTextColor(0xFF888888); // gray
@@ -544,6 +588,73 @@ public class MainActivity extends Activity {
 
         // -- Current resolution --
         updateCurrentRes();
+    }
+
+    /**
+     * Checks whether {@link DisplayMonitorService} is currently running.
+     *
+     * <p>RetroDock now uses an in-process runtime flag maintained by
+     * {@link DisplayMonitorService}. This is more reliable than the deprecated
+     * {@code ActivityManager#getRunningServices()} health check and avoids the false negatives
+     * that caused repeated re-starts of an already-running service.</p>
+     *
+     * @return {@code true} if the service is currently running
+     */
+    private boolean isServiceRunning() {
+        return DisplayMonitorService.isRunningInProcess();
+    }
+
+    /**
+     * Parses the width/height text boxes and ensures both values are positive integers.
+     *
+     * <p>The display stack rejects non-numeric, zero, and negative sizes. Validating here keeps
+     * bad values out of SharedPreferences and prevents later dock events from failing because the
+     * service inherited an impossible resolution from the UI.</p>
+     *
+     * @param showToastOnFailure whether to show a user-facing validation error
+     * @return a two-element array containing width and height, or {@code null} if invalid
+     */
+    private int[] parseResolutionInputs(boolean showToastOnFailure) {
+        String w = widthInput.getText().toString().trim();
+        String h = heightInput.getText().toString().trim();
+        if (w.isEmpty() || h.isEmpty()) {
+            if (showToastOnFailure) {
+                Toast.makeText(this, "Enter width and height", Toast.LENGTH_SHORT).show();
+            }
+            return null;
+        }
+
+        int parsedW;
+        int parsedH;
+        try {
+            parsedW = Integer.parseInt(w);
+            parsedH = Integer.parseInt(h);
+        } catch (NumberFormatException e) {
+            if (showToastOnFailure) {
+                Toast.makeText(this, "Width and height must be numbers", Toast.LENGTH_SHORT).show();
+            }
+            return null;
+        }
+
+        if (parsedW <= 0 || parsedH <= 0) {
+            if (showToastOnFailure) {
+                Toast.makeText(this, "Width and height must be positive numbers", Toast.LENGTH_SHORT).show();
+            }
+            return null;
+        }
+
+        return new int[]{parsedW, parsedH};
+    }
+
+    private boolean isPositiveInteger(String raw) {
+        if (raw == null || raw.trim().isEmpty()) {
+            return false;
+        }
+        try {
+            return Integer.parseInt(raw.trim()) > 0;
+        } catch (NumberFormatException e) {
+            return false;
+        }
     }
 
     /**

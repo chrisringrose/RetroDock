@@ -63,6 +63,14 @@ public final class ResolutionHelper {
      * @return {@code true} if either strategy succeeded.
      */
     public static boolean setResolution(ContentResolver resolver, int width, int height) {
+        // Reject impossible sizes up front instead of feeding them to `wm` or secure settings.
+        // This protects both the manual Test button and the automatic dock handler from storing
+        // or applying values like 0x0 or negative dimensions.
+        if (width <= 0 || height <= 0) {
+            Log.e(TAG, "Refusing to set invalid resolution: " + width + "x" + height);
+            return false;
+        }
+
         // Strategy 1: `wm size` shell command (preferred -- works without special
         // permissions on most devices).
         try {
@@ -87,8 +95,13 @@ public final class ResolutionHelper {
         // Strategy 2: write Settings.Global directly (needs WRITE_SECURE_SETTINGS,
         // granted via: adb shell pm grant com.gavamedia.retrodock android.permission.WRITE_SECURE_SETTINGS).
         try {
-            Settings.Global.putString(resolver, "display_size_forced", width + "," + height);
-            return true;
+            boolean wrote = Settings.Global.putString(resolver, "display_size_forced",
+                    width + "," + height);
+            if (!wrote) {
+                Log.e(TAG, "Settings.Global fallback returned false while setting "
+                        + width + "x" + height);
+            }
+            return wrote;
         } catch (Exception e) {
             Log.e(TAG, "Settings.Global fallback failed: " + e.getMessage());
             return false;
@@ -143,8 +156,11 @@ public final class ResolutionHelper {
 
         // Strategy 2: clear the Settings.Global key.
         try {
-            Settings.Global.putString(resolver, "display_size_forced", "");
-            return true;
+            boolean wrote = Settings.Global.putString(resolver, "display_size_forced", "");
+            if (!wrote) {
+                Log.e(TAG, "Settings.Global reset fallback returned false");
+            }
+            return wrote;
         } catch (Exception e) {
             Log.e(TAG, "Settings.Global reset failed: " + e.getMessage());
             return false;

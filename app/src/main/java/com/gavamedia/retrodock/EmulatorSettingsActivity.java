@@ -313,6 +313,9 @@ public class EmulatorSettingsActivity extends Activity {
             case "duckstation":
                 container.addView(buildDuckStationHotApplySection());
                 break;
+            case "nethersx2":
+                container.addView(buildNetherSx2InfoSection());
+                break;
             case "scummvm":
                 container.addView(buildScummVMHotApplySection());
                 break;
@@ -553,10 +556,21 @@ public class EmulatorSettingsActivity extends Activity {
         }
 
         // ── Branch 1: no settings files found ──────────────────────────
-        // The emulator has probably never been run. Enable it (so the pref is saved)
-        // but warn the user.
+        // The emulator has probably never been run.
+        //
+        // Old behavior bug:
+        //   We persisted emu_{id}_enabled = true even though there was nothing to classify yet.
+        //   After the user launched the emulator once and its config files finally appeared,
+        //   RetroDock would NOT prompt again because the toggle was already on. The first
+        //   swap then fell through the "no backup and no classification" NO_OP path forever.
+        //
+        // Fix:
+        //   Fail closed and keep the emulator disabled until a real config exists. We also flip
+        //   the UI toggle back off so the screen matches the stored preference and the user can
+        //   simply enable it again after the emulator has been run once.
         if (!anySettingsFound) {
-            prefs.edit().putBoolean("emu_" + emu.id + "_enabled", true).apply();
+            prefs.edit().putBoolean("emu_" + emu.id + "_enabled", false).apply();
+            toggle.setChecked(false);
             Toast.makeText(this, emu.displayName + ": no settings files found yet. " +
                     "Run the emulator first, then re-enable.", Toast.LENGTH_LONG).show();
             return;
@@ -842,19 +856,24 @@ public class EmulatorSettingsActivity extends Activity {
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
-     * Builds the DuckStation-specific "Live Shader Swap" hot-apply section.
+     * Builds the DuckStation-specific info and settings section.
      *
-     * <p>DuckStation stores post-processing shader chain names in its
-     * {@code settings.ini}. RetroDock can edit the {@code PostProcessing} value while
-     * DuckStation is running (experimental &mdash; takes effect on next frame or
-     * game load depending on the version).</p>
+     * <h3>Android limitation: no global config swap</h3>
+     * <p>DuckStation on Android stores its main settings in Android SharedPreferences
+     * (an internal key-value store at {@code /data/data/.../shared_prefs/}), NOT in a
+     * {@code settings.ini} file like the desktop version. This is inaccessible without
+     * root access. Therefore, RetroDock <b>cannot</b> swap DuckStation's global settings
+     * (shaders, upscaling, filters) between docked and handheld modes.</p>
      *
-     * <p>UI elements:
-     * <ul>
-     *   <li>Enable toggle &mdash; {@code "duckstation_hot_apply_enabled"}</li>
-     *   <li>Handheld shader chain &mdash; {@code "duckstation_shaders_handheld"}</li>
-     *   <li>Docked shader chain &mdash; {@code "duckstation_shaders_docked"}</li>
-     * </ul>
+     * <h3>What IS supported: per-game settings swap</h3>
+     * <p>DuckStation stores per-game override files as real {@code .ini} files in the
+     * {@code gamesettings/} directory (one file per game serial, e.g.
+     * {@code SLUS-01222.ini}). These files ARE accessible and swappable, so users can
+     * have different per-game shader, upscaling, and filtering settings for docked vs
+     * handheld mode.</p>
+     *
+     * <p>This section displays an informational message explaining the limitation
+     * and how per-game settings swapping works instead.</p>
      *
      * @return the fully constructed LinearLayout for this section
      */
@@ -865,36 +884,73 @@ public class EmulatorSettingsActivity extends Activity {
 
         // ── Sub-header ─────────────────────────────────────────────────
         TextView header = new TextView(this);
-        header.setText("Live Shader Swap (experimental)");
+        header.setText("Per-Game Settings Only");
         header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        header.setTextColor(0xFF9090C0);
+        header.setTextColor(0xFFFF9800);
         header.setPadding(0, dp(4), 0, dp(2));
         section.addView(header);
 
-        // ── Info text ──────────────────────────────────────────────────
+        // ── Info text explaining the Android limitation ─────────────────
         TextView info = new TextView(this);
-        info.setText("Edits PostProcessing in settings.ini while running.\n" +
-                "Shader names are comma-separated (e.g. CRT-Royale,Scanlines).\n" +
-                "Leave empty to disable shaders for that mode.");
+        info.setText("DuckStation on Android stores its main settings internally " +
+                "(SharedPreferences), which is not accessible to other apps. " +
+                "RetroDock can only swap per-game settings (the gamesettings/ folder).\n\n" +
+                "To use this: configure different per-game overrides in DuckStation " +
+                "for each game, then RetroDock will swap the entire gamesettings/ folder " +
+                "between your docked and handheld profiles on dock/undock.");
         info.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
         info.setTextColor(0xFF666688);
         info.setPadding(0, 0, 0, dp(4));
         section.addView(info);
 
-        // ── Enable toggle ──────────────────────────────────────────────
-        // Preference key: "duckstation_hot_apply_enabled"
-        section.addView(buildHotApplyToggle("Enable live shader swap",
-                "duckstation_hot_apply_enabled"));
+        return section;
+    }
 
-        // ── Shader chain text settings ─────────────────────────────────
-        // Comma-separated shader names for each mode.
-        section.addView(buildTextSettingRow("Handheld shaders:",
-                "duckstation_shaders_handheld",
-                "e.g. CRT-Royale (comma-separated)"));
+    // ═══════════════════════════════════════════════════════════════════════
+    //  INFO SECTION: NetherSx2
+    // ═══════════════════════════════════════════════════════════════════════
 
-        section.addView(buildTextSettingRow("Docked shaders:",
-                "duckstation_shaders_docked",
-                "e.g. (empty for no shaders)"));
+    /**
+     * Builds the NetherSx2-specific info section explaining per-game-only support.
+     *
+     * <h3>Android limitation: no global config swap</h3>
+     * <p>NetherSx2 (an AetherSX2 / PCSX2 fork) on Android stores its main settings
+     * (GS.ini, PCSX2.ini, etc.) in the app's private internal storage or
+     * SharedPreferences — NOT as accessible INI files. The {@code inis/} directory
+     * does not exist at the scoped storage path. Confirmed via logcat and ADB.</p>
+     *
+     * <h3>What IS supported: per-game settings swap</h3>
+     * <p>Per-game override files ARE stored as real {@code .ini} files in the
+     * {@code gamesettings/} directory (one file per game CRC hash, e.g.
+     * {@code BEB4577E.ini}). These are accessible and swappable.</p>
+     *
+     * @return the fully constructed LinearLayout for this section
+     */
+    private LinearLayout buildNetherSx2InfoSection() {
+        LinearLayout section = new LinearLayout(this);
+        section.setOrientation(LinearLayout.VERTICAL);
+        section.setPadding(0, dp(8), 0, 0);
+
+        // ── Sub-header ─────────────────────────────────────────────────
+        TextView header = new TextView(this);
+        header.setText("Per-Game Settings Only");
+        header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        header.setTextColor(0xFFFF9800);
+        header.setPadding(0, dp(4), 0, dp(2));
+        section.addView(header);
+
+        // ── Info text explaining the Android limitation ─────────────────
+        TextView info = new TextView(this);
+        info.setText("NetherSx2 on Android stores its main settings internally, " +
+                "which is not accessible to other apps. " +
+                "RetroDock can only swap per-game settings (the gamesettings/ folder).\n\n" +
+                "To use this: configure different per-game overrides in NetherSx2 " +
+                "for each game, then RetroDock will swap the entire gamesettings/ folder " +
+                "between your docked and handheld profiles on dock/undock.");
+        info.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        info.setTextColor(0xFF666688);
+        info.setPadding(0, 0, 0, dp(4));
+        section.addView(info);
 
         return section;
     }
@@ -1054,9 +1110,11 @@ public class EmulatorSettingsActivity extends Activity {
                 .setTitle("Live Swap Warning")
                 .setMessage("Live swap is a temporary convenience.\n\n"
                         + "If you change emulator settings while a live swap feature is active, "
-                        + "RetroDock-managed shader or filter settings may be restored when the "
-                        + "emulator closes so the saved handheld/docked profile still matches "
-                        + "the device's final state.\n\n"
+                        + "RetroDock may restore the last trusted copy of the managed config "
+                        + "file or folder when the emulator closes so the saved handheld/docked "
+                        + "profile still matches the device's final state.\n\n"
+                        + "That means other in-session edits inside that same managed config can "
+                        + "also be discarded, not just the hot-swapped shader or filter value.\n\n"
                         + "For permanent handheld or docked profile edits, close the emulator, "
                         + "switch to the target mode, then reopen the emulator before making "
                         + "those changes.")

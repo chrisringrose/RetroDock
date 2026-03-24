@@ -82,6 +82,15 @@ public class DisplayMonitorService extends Service {
     private static final String CHANNEL_ID = "retrodock_monitor";
     private static final String PREFS_NAME = "retrodock_prefs";
 
+    /**
+     * In-process runtime flag used by MainActivity for service health checks.
+     *
+     * <p>Because RetroDock's Activity and Service run in the same process, a simple static flag
+     * is a safer signal than the deprecated ActivityManager service inspection APIs. The flag is
+     * cleared on {@link #onDestroy()} and naturally resets to {@code false} if the process dies.</p>
+     */
+    private static volatile boolean sRunningInProcess;
+
     private DisplayManager displayManager;
     private DisplayManager.DisplayListener displayListener;
     private Handler handler;
@@ -96,6 +105,7 @@ public class DisplayMonitorService extends Service {
         createNotificationChannel();
         handler = new Handler(Looper.getMainLooper());
         displayManager = getSystemService(DisplayManager.class);
+        sRunningInProcess = true;
     }
 
     @Override
@@ -127,6 +137,20 @@ public class DisplayMonitorService extends Service {
      * sysfs node to determine the actual connection state.
      */
     private void startMonitoring() {
+        // Service re-starts are legal: startService()/startForegroundService() on an already
+        // running service simply route back through onStartCommand(). The previous code blindly
+        // registered a new DisplayListener every time, overwriting the field and leaking the
+        // older registrations. That multiplied callbacks over time and only the most recent
+        // listener was ever unregistered.
+        //
+        // Fix: make monitoring idempotent. If we are already registered, just refresh the current
+        // state instead of adding another listener.
+        if (displayListener != null) {
+            Log.i(TAG, "startMonitoring called while already registered; refreshing state only");
+            checkAndApply();
+            return;
+        }
+
         // Read initial config for logging; checkAndApply() will re-read prefs each time
         // so settings changes take effect immediately without restarting the service.
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
@@ -213,20 +237,37 @@ public class DisplayMonitorService extends Service {
             boolean docked = "connected".equals(status);
 
             if (docked) {
-                int w, h;
+                int w;
+                int h;
                 try {
                     w = Integer.parseInt(width);
                     h = Integer.parseInt(height);
                 } catch (NumberFormatException e) {
+                    // Old behavior bug:
+                    //   a bad saved width/height aborted the entire dock event and also marked the
+                    //   status as already handled. That meant emulator profile swaps were skipped
+                    //   and would not retry until the user physically undocked and docked again.
+                    //
+                    // Fix:
+                    //   resolution switching and profile switching are now decoupled. Invalid
+                    //   resolution prefs skip only the resolution step; RetroDock still processes
+                    //   emulator profile changes for the dock transition.
                     Log.e(TAG, "Invalid resolution values (width=\"" + width + "\", height=\""
-                            + height + "\") — skipping resolution change");
-                    lastStatus = status;
-                    return;
+                            + height + "\") — skipping resolution change but still processing "
+                            + "profile swaps");
+                    updateNotification("Docked — invalid saved resolution");
+                    w = -1;
+                    h = -1;
                 }
-                boolean ok = ResolutionHelper.setResolution(getContentResolver(), w, h);
-                Log.i(TAG, "Set resolution " + width + "x" + height + ": "
-                        + (ok ? "success" : "failed"));
-                updateNotification("Docked — " + width + "x" + height);
+                if (w > 0 && h > 0) {
+                    boolean ok = ResolutionHelper.setResolution(getContentResolver(), w, h);
+                    Log.i(TAG, "Set resolution " + width + "x" + height + ": "
+                            + (ok ? "success" : "failed"));
+                    updateNotification("Docked — " + width + "x" + height);
+                } else {
+                    Log.w(TAG, "Docked profile handling continued without a resolution change "
+                            + "because the saved resolution was invalid");
+                }
             } else {
                 boolean ok = ResolutionHelper.resetResolution(getContentResolver());
                 Log.i(TAG, "Reset resolution: " + (ok ? "success" : "failed"));
@@ -295,7 +336,9 @@ public class DisplayMonitorService extends Service {
         // Clean up: stop listening for display events.
         if (displayManager != null && displayListener != null) {
             displayManager.unregisterDisplayListener(displayListener);
+            displayListener = null;
         }
+        sRunningInProcess = false;
         // Only reset resolution if the user intentionally disabled the service.
         // When the system kills and restarts a START_STICKY service, resetting here
         // would cause a visible resolution flicker before the service restarts and
@@ -311,5 +354,10 @@ public class DisplayMonitorService extends Service {
     @Override
     public IBinder onBind(Intent intent) {
         return null; // Not a bound service.
+    }
+
+    /** Returns whether the monitor service is currently alive in this app process. */
+    static boolean isRunningInProcess() {
+        return sRunningInProcess;
     }
 }

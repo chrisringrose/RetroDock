@@ -10,6 +10,9 @@ import android.content.pm.PackageManager;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * Database of known Android emulators and their configuration layouts, plus support
@@ -206,7 +209,10 @@ public class EmulatorConfig {
                 new String[]{"retroarch.cfg", "config"}));
 
         // Lemuroid -- simple multi-system emulator built on libretro cores.
-        // config/ = core-specific configuration files
+        //
+        // NOTE: Lemuroid only has a scoped storage path. Config file accessibility
+        // depends on Android version and device. If config/ doesn't exist at this
+        // path, RetroDock silently skips this emulator.
         list.add(new EmulatorConfig("lemuroid", "Lemuroid",
                 new String[]{"com.swordfish.lemuroid"},
                 new String[]{"/storage/emulated/0/Android/data/com.swordfish.lemuroid/files"},
@@ -219,10 +225,14 @@ public class EmulatorConfig {
         // Dolphin -- GameCube and Wii emulator.
         // Config/ directory contains Dolphin.ini, GFX.ini, WiimoteNew.ini,
         // GCPadNew.ini, etc. -- all the core and graphics settings.
+        // Packages: standard, handheld-optimized variant.
+        // Config/ directory contains Dolphin.ini, GFX.ini, WiimoteNew.ini,
+        // GCPadNew.ini, etc. -- all the core and graphics settings.
         list.add(new EmulatorConfig("dolphin", "Dolphin (GameCube/Wii)",
-                new String[]{"org.dolphinemu.dolphinemu"},
+                new String[]{"org.dolphinemu.dolphinemu", "org.dolphinemu.handheld"},
                 new String[]{"/storage/emulated/0/dolphin-emu",
-                        "/storage/emulated/0/Android/data/org.dolphinemu.dolphinemu/files"},
+                        "/storage/emulated/0/Android/data/org.dolphinemu.dolphinemu/files",
+                        "/storage/emulated/0/Android/data/org.dolphinemu.handheld/files"},
                 new String[]{"Config"}));
 
         // Citra -- Nintendo 3DS emulator (original project, now discontinued).
@@ -285,7 +295,12 @@ public class EmulatorConfig {
 
         // Pizza Boy -- Game Boy Advance and Game Boy Color emulator.
         // Packages: GBA free, GBA pro, GBC free, GBC pro.
-        // settings.json = single JSON file containing all emulator preferences
+        //
+        // NOTE: Pizza Boy on Android likely stores its main settings in SharedPreferences
+        // (inaccessible without root), not as a settings.json in scoped storage. The
+        // scoped storage path is included speculatively — if settings.json doesn't exist
+        // there, RetroDock will simply skip this emulator during swaps (no harm done).
+        // settings.json = single JSON file containing all emulator preferences (if present)
         list.add(new EmulatorConfig("pizza", "Pizza Boy (GBA/GBC)",
                 new String[]{"it.dbtecno.pizzaboygba", "it.dbtecno.pizzaboygbapro",
                         "it.dbtecno.pizzaboygbc", "it.dbtecno.pizzaboygbcpro"},
@@ -295,8 +310,12 @@ public class EmulatorConfig {
 
         // Mupen64Plus FZ -- Nintendo 64 emulator by Francisco Zurita.
         // Packages: free and pro versions.
-        // profiles/         = controller mappings and emulation profile presets
-        // mupen64plus.cfg   = core configuration file (video plugin, paths, etc.)
+        //
+        // NOTE: Confirmed via testing that the scoped storage files/ directory is EMPTY.
+        // Mupen64Plus FZ stores all settings (including profiles and mupen64plus.cfg) in
+        // Android's internal app storage (/data/data/), inaccessible without root.
+        // Config paths are included speculatively — if nothing exists, RetroDock silently
+        // skips this emulator during swaps.
         list.add(new EmulatorConfig("mupen64", "Mupen64Plus FZ (N64)",
                 new String[]{"org.mupen64plusae.v3.fzurita", "org.mupen64plusae.v3.fzurita.pro"},
                 new String[]{"/storage/emulated/0/Android/data/org.mupen64plusae.v3.fzurita/files",
@@ -320,14 +339,20 @@ public class EmulatorConfig {
                 new String[]{"melonDS.ini"}));
 
         // Snes9x EX+ -- Super Nintendo emulator (EX+ Android port).
-        // snes9x.conf = single configuration file
+        //
+        // NOTE: Snes9x EX+ only has a scoped storage path. Config file accessibility
+        // depends on Android version and device. If snes9x.conf doesn't exist at this
+        // path, RetroDock silently skips this emulator.
         list.add(new EmulatorConfig("snes9x", "Snes9x EX+ (SNES)",
                 new String[]{"com.explusalpha.Snes9xPlus"},
                 new String[]{"/storage/emulated/0/Android/data/com.explusalpha.Snes9xPlus/files"},
                 new String[]{"snes9x.conf"}));
 
         // mGBA -- Game Boy Advance emulator.
-        // config.ini = single INI configuration file
+        //
+        // NOTE: mGBA only has a scoped storage path. Config file accessibility
+        // depends on Android version and device. If config.ini doesn't exist at this
+        // path, RetroDock silently skips this emulator.
         list.add(new EmulatorConfig("mgba", "mGBA (GBA)",
                 new String[]{"io.mgba.mgba"},
                 new String[]{"/storage/emulated/0/Android/data/io.mgba.mgba/files"},
@@ -338,22 +363,43 @@ public class EmulatorConfig {
         // =====================================================================
 
         // DuckStation -- PlayStation 1 emulator.
-        // settings.ini    = global configuration (video, audio, controller, BIOS path, etc.)
-        // gamesettings/   = per-game override INI files (keyed by game serial)
+        //
+        // NOTE: DuckStation on Android stores its MAIN settings in Android SharedPreferences
+        // (an internal key-value store at /data/data/.../shared_prefs/), NOT in a settings.ini
+        // file. This is inaccessible without root. The desktop version uses settings.ini, but
+        // the Android version never has.
+        //
+        // However, PER-GAME settings ARE stored as real .ini files in gamesettings/ (one file
+        // per game serial, e.g. "SLUS-01222.ini"). These are accessible and swappable, allowing
+        // users to have different per-game shader/upscaling/filtering settings for docked vs
+        // handheld mode.
+        //
+        // RetroDock can only swap gamesettings/ for DuckStation — not the global app config.
         list.add(new EmulatorConfig("duckstation", "DuckStation (PS1)",
                 new String[]{"com.github.stenzek.duckstation"},
                 new String[]{"/storage/emulated/0/Android/data/com.github.stenzek.duckstation/files",
                         "/storage/emulated/0/duckstation"},
-                new String[]{"settings.ini", "gamesettings"}));
+                new String[]{"gamesettings"}));
 
-        // NetherSx2 -- PlayStation 2 emulator (AetherSX2 continuation).
-        // inis/           = GS.ini, PCSX2.ini, etc. (one INI per subsystem)
-        // gamesettings/   = per-game override files
+        // NetherSx2 -- PlayStation 2 emulator (AetherSX2 continuation / PCSX2 fork).
+        //
+        // NOTE: Like DuckStation, NetherSx2 on Android stores its MAIN settings
+        // (GS.ini, PCSX2.ini, etc.) internally via SharedPreferences or in the app's
+        // private /data/data/ directory — NOT as accessible INI files. The inis/
+        // directory does not exist at the scoped storage path. Confirmed via logcat:
+        // EmuFolders::Settings points to the scoped storage root, but no inis/ folder
+        // is created there.
+        //
+        // However, PER-GAME settings ARE stored as real .ini files in gamesettings/
+        // (one file per game CRC hash, e.g. "BEB4577E.ini"). These are accessible and
+        // swappable, allowing different per-game graphics/upscaling settings per mode.
+        //
+        // RetroDock can only swap gamesettings/ for NetherSx2 — not the global config.
         list.add(new EmulatorConfig("nethersx2", "NetherSx2 (PS2)",
                 new String[]{"xyz.aethersx2.android"},
                 new String[]{"/storage/emulated/0/Android/data/xyz.aethersx2.android/files",
                         "/storage/emulated/0/AetherSX2"},
-                new String[]{"inis", "gamesettings"}));
+                new String[]{"gamesettings"}));
 
         // PPSSPP -- PlayStation Portable emulator.
         // Packages: free and gold (paid) versions.
@@ -425,7 +471,10 @@ public class EmulatorConfig {
 
         // MAME4droid -- Arcade machine emulator for Android.
         // Packages: 2024 and legacy versions.
-        // mame4droid.cfg = single configuration file with input mappings and options
+        //
+        // NOTE: MAME4droid only has scoped storage paths. Config file accessibility
+        // depends on Android version and device. If mame4droid.cfg doesn't exist at
+        // these paths, RetroDock silently skips this emulator.
         list.add(new EmulatorConfig("mame4droid", "MAME4droid (Arcade)",
                 new String[]{"com.seleuco.mame4droid2024", "com.seleuco.mame4droid"},
                 new String[]{"/storage/emulated/0/Android/data/com.seleuco.mame4droid2024/files",
@@ -531,6 +580,26 @@ public class EmulatorConfig {
         int count = prefs.getInt(CUSTOM_COUNT_KEY, 0);
         if (index < 0 || index >= count) return;
 
+        // Take one immutable snapshot of the current preference map before we start mutating.
+        // This is critical for safe ID migration:
+        //
+        //   custom_0 removed
+        //   custom_1 shifts down and becomes custom_0
+        //
+        // All of RetroDock's per-emulator state is keyed by the synthetic ID (for example
+        // emu_custom_1_enabled, emu_custom_1_classified, emu_custom_1_override_..., and the
+        // hot-session bookkeeping keys). If we only shift the custom_emu_{i}_* metadata rows and
+        // delete the removed emulator's keys, every surviving shifted emulator silently loses its
+        // state because the old keys remain under the now-unused higher index.
+        //
+        // The safe fix is:
+        //   1. snapshot the old pref map,
+        //   2. clear the entire emu_custom_{index..count-1}_* namespace,
+        //   3. copy each old emu_custom_{i+1}_* prefix down to emu_custom_{i}_* from the snapshot.
+        //
+        // Using the snapshot avoids a common migration bug where a key that has already been moved
+        // is then read again under its new name and shifted a second time.
+        Map<String, ?> allPrefs = prefs.getAll();
         SharedPreferences.Editor editor = prefs.edit();
         // Shift entries down to fill the gap left by the removed entry
         for (int i = index; i < count - 1; i++) {
@@ -548,38 +617,93 @@ public class EmulatorConfig {
         editor.remove("custom_emu_" + (count - 1) + "_path");
         editor.remove("custom_emu_" + (count - 1) + "_settings");
         editor.putInt(CUSTOM_COUNT_KEY, count - 1);
-        // Clean up ALL per-emulator preferences for the removed entry.
-        // In addition to _enabled and _path, we also need to remove:
-        //   - emu_{id}_classified: the handheld/docked classification set on first enable
-        //   - emu_{id}_override_{relPath}: per-settings-file path overrides created in
-        //     EmulatorSettingsActivity's browse dialog (relPath has "/" replaced with "_")
-        // Failing to remove these leaves orphaned prefs that could conflict if a new
-        // custom emulator is later assigned the same index/id.
-        String oldId = "custom_" + index;
-        editor.remove("emu_" + oldId + "_enabled");
-        editor.remove("emu_" + oldId + "_path");
-        editor.remove("emu_" + oldId + "_classified");
 
-        // Remove override keys for each settings file that was configured.
-        // The settings file path for this entry is stored under custom_emu_{index}_settings.
-        String settingsStr = prefs.getString("custom_emu_" + index + "_settings", "");
-        if (!settingsStr.isEmpty()) {
-            // Settings files are stored as individual entries; each generates an
-            // override key of the form "emu_{id}_override_{relPath}" where slashes
-            // in relPath are replaced with underscores.
-            String sanitised = settingsStr.replace("/", "_");
-            editor.remove("emu_" + oldId + "_override_" + sanitised);
+        // Clear the entire affected emu_custom_* namespace first. This removes the deleted
+        // emulator's state and also clears the destination prefixes for shifted entries so no
+        // stale keys survive beside the migrated ones.
+        for (int i = index; i < count; i++) {
+            removePrefsWithPrefix(editor, allPrefs, "emu_custom_" + i + "_");
         }
 
-        // Also iterate all prefs to catch any override keys we might have missed
-        // (e.g. if settings files were changed after initial setup).
-        String overridePrefix = "emu_" + oldId + "_override_";
-        for (String key : prefs.getAll().keySet()) {
-            if (key.startsWith(overridePrefix)) {
-                editor.remove(key);
-            }
+        // Recreate the shifted emulator IDs from the snapshot. This migrates every key under the
+        // prefix, not just a hand-picked subset, so future per-emulator features automatically
+        // ride along with the same migration logic.
+        for (int i = index + 1; i < count; i++) {
+            copyPrefsWithPrefix(editor, allPrefs,
+                    "emu_custom_" + i + "_",
+                    "emu_custom_" + (i - 1) + "_");
         }
 
         editor.apply();
+    }
+
+    /**
+     * Removes every preference key that starts with the given prefix.
+     *
+     * <p>SharedPreferences has no native "remove by prefix" API, so custom-emulator ID
+     * migration must enumerate the snapshot map and explicitly remove each matching key.</p>
+     */
+    private static void removePrefsWithPrefix(SharedPreferences.Editor editor,
+                                              Map<String, ?> allPrefs,
+                                              String prefix) {
+        for (String key : allPrefs.keySet()) {
+            if (key.startsWith(prefix)) {
+                editor.remove(key);
+            }
+        }
+    }
+
+    /**
+     * Copies every preference under one per-emulator prefix to another prefix.
+     *
+     * <p>This is the heart of the custom-ID migration fix. Rather than hard-coding a short list
+     * of known keys, we migrate the entire prefix so enable flags, classification, path overrides,
+     * cached resolutions, hot-session markers, and future emulator-scoped prefs all stay attached
+     * to the correct custom entry when indices shift.</p>
+     */
+    private static void copyPrefsWithPrefix(SharedPreferences.Editor editor,
+                                            Map<String, ?> allPrefs,
+                                            String fromPrefix,
+                                            String toPrefix) {
+        for (Map.Entry<String, ?> entry : allPrefs.entrySet()) {
+            String key = entry.getKey();
+            if (!key.startsWith(fromPrefix)) {
+                continue;
+            }
+            String migratedKey = toPrefix + key.substring(fromPrefix.length());
+            putPreferenceValue(editor, migratedKey, entry.getValue());
+        }
+    }
+
+    /**
+     * Writes one snapshot value back into SharedPreferences using the correct typed setter.
+     *
+     * <p>Custom-emulator migration needs to preserve the original value type. Using only
+     * {@code toString()} here would corrupt booleans such as enabled/classified flags and break
+     * later reads. The app currently uses mostly String and boolean values, but the helper also
+     * preserves the other standard SharedPreferences scalar types for forward compatibility.</p>
+     */
+    @SuppressWarnings("unchecked")
+    private static void putPreferenceValue(SharedPreferences.Editor editor, String key, Object value) {
+        if (value instanceof String) {
+            editor.putString(key, (String) value);
+        } else if (value instanceof Boolean) {
+            editor.putBoolean(key, (Boolean) value);
+        } else if (value instanceof Integer) {
+            editor.putInt(key, (Integer) value);
+        } else if (value instanceof Long) {
+            editor.putLong(key, (Long) value);
+        } else if (value instanceof Float) {
+            editor.putFloat(key, (Float) value);
+        } else if (value instanceof Set) {
+            editor.putStringSet(key, new HashSet<>((Set<String>) value));
+        } else if (value == null) {
+            editor.remove(key);
+        } else {
+            // Defensive fallback: unknown value types are not expected from SharedPreferences,
+            // but logging the anomaly is safer than silently discarding data during a migration.
+            throw new IllegalArgumentException("Unsupported SharedPreferences value type for key "
+                    + key + ": " + value.getClass().getName());
+        }
     }
 }

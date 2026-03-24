@@ -433,6 +433,35 @@ public class ProfileSwitcher {
         return emulatorSwapLocks.computeIfAbsent(emulatorId, k -> new Object());
     }
 
+    /**
+     * Runs one operation while holding the same per-emulator lock used by swaps and recovery.
+     *
+     * <p><b>Why this helper exists:</b> delayed hot-apply workers run on background threads that
+     * can overlap with the exit watcher. That overlap is dangerous because the exit watcher
+     * restores trusted snapshots and may perform a real docked/handheld swap, while hot-apply
+     * may still be rewriting a config file or sending a live command for the same emulator.</p>
+     *
+     * <p><b>The race this prevents:</b>
+     * <ol>
+     *   <li>Dock event schedules a delayed hot-apply worker.</li>
+     *   <li>The worker starts and passes its "is the emulator running?" check.</li>
+     *   <li>The user exits the emulator before the worker finishes.</li>
+     *   <li>The exit watcher finalizes the hot session and restores/swaps files.</li>
+     *   <li>The original worker then resumes and writes a config file after finalization.</li>
+     * </ol>
+     * That sequence would let a live-edit thread land new bytes after RetroDock believed it had
+     * already restored the last trusted state.</p>
+     *
+     * <p><b>Fix:</b> hot-apply workers, ordinary swaps, crash recovery, and exit-time
+     * finalization all acquire the same per-emulator monitor. Only one of those integrity-
+     * sensitive operations may run at a time.</p>
+     */
+    static void runWithEmulatorLock(String emulatorId, Runnable operation) {
+        synchronized (getEmulatorLock(emulatorId)) {
+            operation.run();
+        }
+    }
+
     // ==================================================================================
     // Exit Watcher State
     // ==================================================================================
