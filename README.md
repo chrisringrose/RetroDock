@@ -13,17 +13,17 @@ But resolution is just one issue; when you move from a 4-inch handheld screen to
 - **Shaders**: Some shaders look great on your TV, but not so great on the tiny screen. Now you can use one when handheld, and another one when docked.
 - **Scaling and filters**: Bilinear filtering smooths pixels nicely on a big display but wastes detail on a small one.
 - **Controls**: You might want different button mappings for a docked controller vs handheld buttons.
-- **Per-game overrides**: Maybe you want a specific CRT shader for SNES games on the TV, but a clean integer-scale shader for GBA games.
+- **Per-game overrides**: Maybe you want a specific CRT shader for SNES games on the TV, but a clean look on handheld.
 
 RetroDock handles all of this automatically. Dock your device, and it loads your "docked" settings. Undock, and it switches back to "handheld." No menus, no manual swapping.
 
 ### The CRT TV use case
 
-If you connect your handheld to an actual CRT television via a RetroTINK or similar adapter, RetroDock makes this seamless. Set your docked resolution to match your CRT's native output, configure CRT-appropriate shaders, and RetroDock transforms your pocket device into the ultimate retro console — then switches right back to handheld mode when you unplug.
+If you connect your handheld to an actual CRT television with HDMI to RCA, RetroDock makes this seamless. Set your docked resolution to match your CRT's native output, configure CRT-appropriate shaders, and RetroDock transforms your pocket device into the ultimate retro console — then switches right back to handheld mode when you unplug.
 
 ## Features
 
-- **Automatic dock detection** via DRM connector status (event-driven, no polling)
+- **Automatic dock detection** via DRM connector status (event-driven, no background polling)
 - **Resolution switching** to your preferred docked output (e.g. 1080p, 4K, or CRT-appropriate)
 - **Device auto-detection** for 30+ known handhelds with suggested docked resolutions
 - **Emulator settings swap** — maintains separate docked/handheld versions of config files and directories
