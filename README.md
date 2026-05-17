@@ -185,3 +185,4 @@ Or simply uninstall DockRes from Settings > Apps before installing RetroDock.
 ## License
 
 MIT License. Copyright (c) 2026 [Gavamedia](https://gavamedia.com). See [LICENSE](LICENSE) for details.
+.

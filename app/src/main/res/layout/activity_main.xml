@@ -250,6 +250,52 @@
             android:textColor="#666666"
             android:layout_marginBottom="20dp" />
 
+        <!-- ES-DE Controller Fix -->
+        <LinearLayout
+            android:id="@+id/esde_section"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone"
+            android:layout_marginBottom="16dp">
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:background="#333355"
+                android:layout_marginBottom="16dp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginBottom="4dp">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Auto-restart ES-DE on controller connect"
+                    android:textColor="#FFFFFF"
+                    android:textSize="14sp" />
+
+                <Switch
+                    android:id="@+id/esde_restart_toggle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" />
+
+            </LinearLayout>
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="When docked and a Bluetooth gamepad connects, restarts ES-DE so the controller works in menus. Does not affect running games."
+                android:textSize="12sp"
+                android:textColor="#666666" />
+
+        </LinearLayout>
+
         <!-- Divider -->
         <View
             android:layout_width="match_parent"

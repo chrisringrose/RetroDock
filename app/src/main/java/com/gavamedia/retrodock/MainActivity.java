@@ -7,6 +7,7 @@ package com.gavamedia.retrodock;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.hardware.display.DisplayManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -203,6 +204,7 @@ public class MainActivity extends Activity {
         setupTestResetButtons();
         setupEmulatorProfilesButton();
         setupRestoreSuggestedButton();
+        setupEsdeRestartToggle();
 
         // -- Start display monitoring for live UI updates --
         startDisplayListener();
@@ -341,6 +343,11 @@ public class MainActivity extends Activity {
             } else {
                 startService(serviceIntent);
             }
+            // The service's onCreate() sets sRunningInProcess = true, but it hasn't
+            // executed yet at this point (it runs on the next message loop iteration).
+            // Schedule a delayed UI refresh so the status text updates after the
+            // service has actually started, instead of showing a stale "not running".
+            handler.postDelayed(this::refreshUI, 500);
         }
 
         // -- Restore suggested button --
@@ -435,6 +442,9 @@ public class MainActivity extends Activity {
                 // Save current resolution values before starting the service
                 saveResolution(resolution[0], resolution[1]);
                 startMonitorService();
+                // Delayed refresh so the status text updates after the service's
+                // onCreate() has set sRunningInProcess = true.
+                handler.postDelayed(() -> refreshUI(), 500);
             } else {
                 stopMonitorService();
             }
@@ -477,6 +487,39 @@ public class MainActivity extends Activity {
     private void setupEmulatorProfilesButton() {
         findViewById(R.id.emulator_profiles_button).setOnClickListener(v -> {
             startActivity(new Intent(this, EmulatorSettingsActivity.class));
+        });
+    }
+
+    /**
+     * Sets up the ES-DE auto-restart toggle.
+     *
+     * <p>This section is only visible if ES-DE (EmulationStation Desktop Edition) is
+     * installed on the device. When enabled, RetroDock will automatically restart ES-DE
+     * whenever a Bluetooth gamepad connects while the device is docked.</p>
+     *
+     * <h3>Why this is needed</h3>
+     * <p>ES-DE uses SDL2 for input device enumeration, which only happens at startup.
+     * If a Bluetooth controller connects after ES-DE is already running, the controller
+     * is invisible to ES-DE's menu system. Force-restarting ES-DE causes SDL2 to
+     * re-enumerate all input devices, making the Bluetooth controller work.</p>
+     */
+    private void setupEsdeRestartToggle() {
+        View esdeSection = findViewById(R.id.esde_section);
+
+        // Only show this section if ES-DE is installed
+        try {
+            getPackageManager().getPackageInfo("org.es_de.frontend", 0);
+        } catch (PackageManager.NameNotFoundException e) {
+            esdeSection.setVisibility(View.GONE);
+            return;
+        }
+
+        esdeSection.setVisibility(View.VISIBLE);
+
+        Switch toggle = findViewById(R.id.esde_restart_toggle);
+        toggle.setChecked(prefs.getBoolean("esde_restart_on_bt", false));
+        toggle.setOnCheckedChangeListener((v, checked) -> {
+            prefs.edit().putBoolean("esde_restart_on_bt", checked).apply();
         });
     }
 

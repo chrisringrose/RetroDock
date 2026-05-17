@@ -7,6 +7,8 @@
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <!--
          Package visibility fix:
@@ -60,6 +62,7 @@
         <package android:name="bruenor.magicbox.free" />
         <package android:name="com.seleuco.mame4droid2024" />
         <package android:name="com.seleuco.mame4droid" />
+        <package android:name="org.es_de.frontend" />
     </queries>
 
     <application
